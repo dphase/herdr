@@ -1530,6 +1530,9 @@ pub struct AppState {
     pub sidebar_section_split: f32,
     pub agent_panel_sort: AgentPanelSort,
     pub status_indicators: crate::config::StatusIndicatorStyle,
+    /// Current frame of the animated working indicator (0..10). Advanced by the
+    /// server spinner timer; read by every status glyph render site.
+    pub spinner_phase: u8,
     /// Transient session-wide projection override for the built-in Agents view.
     pub agent_view_override: Option<crate::api::schema::AgentViewSetParams>,
     pub sidebar_agents: crate::config::AgentsSidebarConfig,
@@ -1925,6 +1928,7 @@ impl AppState {
             sidebar_section_split: 0.5,
             agent_panel_sort: AgentPanelSort::Spaces,
             status_indicators: crate::config::StatusIndicatorStyle::Dots,
+            spinner_phase: 0,
             agent_view_override: None,
             sidebar_agents: crate::config::AgentsSidebarConfig::default(),
             sidebar_spaces: crate::config::SpacesSidebarConfig::default(),

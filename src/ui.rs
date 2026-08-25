@@ -59,6 +59,10 @@ use self::status::{
     copy_feedback_rect, render_config_diagnostic, render_copy_feedback, render_toast_notification,
     toast_notification_rect,
 };
+// `mod status` is private, so this re-export is how the spinner glyph table
+// reaches the server-side spinner timer. Allowed unused until that timer lands.
+#[allow(unused_imports)]
+pub(crate) use self::status::{spinner_frame, SPINNER_FRAMES};
 pub(crate) use self::tab_surface::{
     compute_tab_surface, render_tab_surface, resize_tab_surface, TabSurfaceLayout,
 };

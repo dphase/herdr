@@ -792,7 +792,13 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
             break;
         }
         let (agg_state, agg_seen) = ws.aggregate_state(&app.terminals);
-        let (icon, icon_style) = state_icon(agg_state, agg_seen, app.status_indicators, p);
+        let (icon, icon_style) = state_icon(
+            agg_state,
+            agg_seen,
+            app.status_indicators,
+            app.spinner_phase,
+            p,
+        );
         let is_selected = visible_idx == app.selected && is_navigating;
         let is_active = Some(visible_idx) == app.active;
         let selection_bg = workspace_selection_background(p, is_active);
@@ -859,8 +865,13 @@ pub(super) fn render_sidebar_collapsed(app: &AppState, frame: &mut Frame, area: 
             } else {
                 Style::default().fg(p.overlay0)
             };
-            let (icon, icon_style) =
-                state_icon(detail.state, detail.seen, app.status_indicators, p);
+            let (icon, icon_style) = state_icon(
+                detail.state,
+                detail.seen,
+                app.status_indicators,
+                app.spinner_phase,
+                p,
+            );
 
             if is_active {
                 let buf = frame.buffer_mut();
@@ -1304,7 +1315,13 @@ fn render_workspace_list(
             .filter(|(_, collapsed)| *collapsed)
             .map(|(key, _)| space_aggregate_state(app, key))
             .unwrap_or((agg_state, agg_seen));
-        let state_icon = state_icon(display_state, display_seen, app.status_indicators, p);
+        let state_icon = state_icon(
+            display_state,
+            display_seen,
+            app.status_indicators,
+            app.spinner_phase,
+            p,
+        );
         let state_text_style = Style::default()
             .fg(state_label_color(display_state, display_seen, p))
             .add_modifier(Modifier::DIM);
@@ -1517,7 +1534,13 @@ fn render_agent_detail(
             Style::default().fg(label_color).add_modifier(Modifier::DIM)
         };
         let agent_style = Style::default().fg(p.overlay0).add_modifier(Modifier::DIM);
-        let state_icon = state_icon(detail.state, detail.seen, app.status_indicators, p);
+        let state_icon = state_icon(
+            detail.state,
+            detail.seen,
+            app.status_indicators,
+            app.spinner_phase,
+            p,
+        );
 
         for (row_index, resolved) in rows.iter().take(height as usize).enumerate() {
             let mut spans = vec![Span::raw(if row_index == 0 { " " } else { "   " })];

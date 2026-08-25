@@ -193,10 +193,20 @@ pub(super) fn render_config_diagnostic(frame: &mut Frame, area: Rect, message: &
     }
 }
 
+/// Braille frames for the animated working indicator, in display order. These
+/// are the 0.7.5 spinner frames.
+pub(crate) const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Glyph shown for `phase`; phases past the table wrap.
+pub(crate) fn spinner_frame(phase: u8) -> &'static str {
+    SPINNER_FRAMES[usize::from(phase) % SPINNER_FRAMES.len()]
+}
+
 pub(super) fn state_icon_symbol(
     state: AgentState,
     seen: bool,
     indicator_style: StatusIndicatorStyle,
+    spinner_phase: u8,
 ) -> &'static str {
     match (indicator_style, state, seen) {
         (StatusIndicatorStyle::Dots, AgentState::Blocked, _) => "●",
@@ -204,11 +214,28 @@ pub(super) fn state_icon_symbol(
         (StatusIndicatorStyle::Dots, AgentState::Idle, false) => "●",
         (StatusIndicatorStyle::Dots, AgentState::Idle, true) => "○",
         (StatusIndicatorStyle::Dots, AgentState::Unknown, _) => "·",
-        (StatusIndicatorStyle::Symbols, AgentState::Blocked, _) => "×",
+        (
+            StatusIndicatorStyle::Symbols | StatusIndicatorStyle::Animated,
+            AgentState::Blocked,
+            _,
+        ) => "×",
         (StatusIndicatorStyle::Symbols, AgentState::Working, _) => "◐",
-        (StatusIndicatorStyle::Symbols, AgentState::Idle, false) => "✓",
-        (StatusIndicatorStyle::Symbols, AgentState::Idle, true) => "○",
-        (StatusIndicatorStyle::Symbols, AgentState::Unknown, _) => "·",
+        (StatusIndicatorStyle::Animated, AgentState::Working, _) => spinner_frame(spinner_phase),
+        (
+            StatusIndicatorStyle::Symbols | StatusIndicatorStyle::Animated,
+            AgentState::Idle,
+            false,
+        ) => "✓",
+        (
+            StatusIndicatorStyle::Symbols | StatusIndicatorStyle::Animated,
+            AgentState::Idle,
+            true,
+        ) => "○",
+        (
+            StatusIndicatorStyle::Symbols | StatusIndicatorStyle::Animated,
+            AgentState::Unknown,
+            _,
+        ) => "·",
     }
 }
 
@@ -216,10 +243,11 @@ pub(super) fn state_icon(
     state: AgentState,
     seen: bool,
     indicator_style: StatusIndicatorStyle,
+    spinner_phase: u8,
     p: &Palette,
 ) -> (&'static str, Style) {
     (
-        state_icon_symbol(state, seen, indicator_style),
+        state_icon_symbol(state, seen, indicator_style, spinner_phase),
         Style::default().fg(state_label_color(state, seen, p)),
     )
 }
@@ -266,11 +294,12 @@ mod tests {
     }
 
     #[test]
-    fn state_icons_support_dot_and_distinct_symbol_styles() {
+    fn state_icons_support_dot_distinct_and_animated_styles() {
         let palette = Palette::catppuccin();
         for (indicator_style, expected_symbols) in [
             (StatusIndicatorStyle::Dots, ["●", "●", "●", "○", "·"]),
             (StatusIndicatorStyle::Symbols, ["×", "◐", "✓", "○", "·"]),
+            (StatusIndicatorStyle::Animated, ["×", "⠋", "✓", "○", "·"]),
         ] {
             for ((state, seen, color), expected_symbol) in [
                 (AgentState::Blocked, true, palette.red),
@@ -282,11 +311,43 @@ mod tests {
             .into_iter()
             .zip(expected_symbols)
             {
-                let (actual_symbol, style) = state_icon(state, seen, indicator_style, &palette);
+                let (actual_symbol, style) = state_icon(state, seen, indicator_style, 0, &palette);
                 assert_eq!(actual_symbol, expected_symbol);
                 assert_eq!(display_width_u16(actual_symbol), 1);
                 assert_eq!(style.fg, Some(color));
             }
+        }
+    }
+
+    #[test]
+    fn animated_working_glyph_cycles_through_braille_frames() {
+        let palette = Palette::catppuccin();
+        for (phase, expected) in SPINNER_FRAMES.iter().enumerate() {
+            let (symbol, _) = state_icon(
+                AgentState::Working,
+                true,
+                StatusIndicatorStyle::Animated,
+                phase as u8,
+                &palette,
+            );
+            assert_eq!(symbol, *expected);
+            assert_eq!(display_width_u16(symbol), 1);
+        }
+        assert_eq!(
+            spinner_frame(10),
+            SPINNER_FRAMES[0],
+            "phase wraps after the last frame"
+        );
+        // Non-working glyphs ignore the phase entirely.
+        for phase in 0..10u8 {
+            let (symbol, _) = state_icon(
+                AgentState::Blocked,
+                true,
+                StatusIndicatorStyle::Animated,
+                phase,
+                &palette,
+            );
+            assert_eq!(symbol, "×");
         }
     }
 

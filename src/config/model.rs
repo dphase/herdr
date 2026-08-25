@@ -123,6 +123,7 @@ pub enum StatusIndicatorStyle {
     #[default]
     Dots,
     Symbols,
+    Animated,
 }
 
 impl StatusIndicatorStyle {
@@ -130,6 +131,7 @@ impl StatusIndicatorStyle {
         match self {
             Self::Dots => "dots",
             Self::Symbols => "symbols",
+            Self::Animated => "animated",
         }
     }
 }
@@ -903,7 +905,8 @@ pub struct UiConfig {
     /// Retired setting that Herdr wrote before the workspace filter was removed.
     #[serde(rename = "agent_panel_scope")]
     _legacy_agent_panel_scope: Option<LegacyAgentPanelScopeConfig>,
-    /// Agent status indicator style. Saved values are "dots" or "symbols". Default: "dots".
+    /// Agent status indicator style. Saved values are "dots", "symbols", or
+    /// "animated". Default: "dots".
     pub status_indicators: StatusIndicatorStyle,
     /// Expanded sidebar row composition.
     pub sidebar: SidebarConfig,
@@ -1388,6 +1391,16 @@ status_indicators = "symbols"
         )
         .unwrap();
         assert_eq!(config.ui.status_indicators, StatusIndicatorStyle::Symbols);
+
+        let config: Config = toml::from_str(
+            r#"
+[ui]
+status_indicators = "animated"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.ui.status_indicators, StatusIndicatorStyle::Animated);
+        assert_eq!(StatusIndicatorStyle::Animated.as_str(), "animated");
     }
 
     #[test]

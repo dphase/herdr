@@ -651,6 +651,7 @@ impl App {
             sidebar_section_split,
             agent_panel_sort,
             status_indicators: config.ui.status_indicators,
+            spinner_phase: 0,
             agent_view_override: None,
             sidebar_agents: config.ui.sidebar.agents.clone(),
             sidebar_spaces: config.ui.sidebar.spaces.clone(),
