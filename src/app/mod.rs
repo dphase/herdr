@@ -3688,6 +3688,29 @@ mod tests {
     }
 
     #[test]
+    fn save_status_indicators_persists_animated() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("save-status-indicators-animated");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "onboarding = false\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        app.save_status_indicators(crate::config::StatusIndicatorStyle::Animated);
+
+        assert_eq!(
+            app.state.status_indicators,
+            crate::config::StatusIndicatorStyle::Animated
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("status_indicators = \"animated\""));
+        assert!(app.state.config_diagnostic.is_none());
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn save_agent_panel_sort_persists_then_applies_live_config() {
         let _guard = config_env_lock().lock().unwrap();
         let path = temp_config_path("save-agent-panel-sort");

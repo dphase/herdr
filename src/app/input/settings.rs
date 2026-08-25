@@ -177,9 +177,8 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
             },
         },
         SettingsSection::Indicators => match key.code {
-            KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
-                state.settings.list.selected = 1 - state.settings.list.selected.min(1);
-            }
+            KeyCode::Up | KeyCode::Char('k') => state.settings.list.move_prev(),
+            KeyCode::Down | KeyCode::Char('j') => state.settings.list.move_next(3),
             KeyCode::Enter | KeyCode::Char(' ') => {
                 let style = status_indicator_for_index(state.settings.list.selected);
                 return Some(SettingsAction::SaveStatusIndicators(style));
@@ -379,7 +378,15 @@ impl AppState {
                 let idx = scroll + (row - area.y) as usize;
                 (idx < THEME_NAMES.len()).then_some(idx)
             }
-            SettingsSection::Indicators | SettingsSection::Sound => {
+            SettingsSection::Indicators => {
+                let list_y = area.y + 3;
+                if row >= list_y && row < list_y + 3 {
+                    Some((row - list_y) as usize)
+                } else {
+                    None
+                }
+            }
+            SettingsSection::Sound => {
                 let list_y = area.y + 3;
                 if row >= list_y && row < list_y + 2 {
                     Some((row - list_y) as usize)
@@ -690,5 +697,68 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/herdr-test-integration"),
             state,
         }
+    }
+
+    #[test]
+    fn settings_indicator_down_reaches_the_animated_row_and_saves_it() {
+        let mut state = state_with_workspaces(&["test"]);
+        open_settings_at(&mut state, SettingsSection::Indicators);
+        assert_eq!(state.settings.list.selected, 0);
+
+        for _ in 0..3 {
+            update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            );
+        }
+        assert_eq!(
+            state.settings.list.selected, 2,
+            "down clamps at the last row"
+        );
+
+        let action = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(
+            action,
+            Some(SettingsAction::SaveStatusIndicators(
+                StatusIndicatorStyle::Animated
+            ))
+        );
+
+        for _ in 0..3 {
+            update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+            );
+        }
+        assert_eq!(
+            state.settings.list.selected, 0,
+            "up clamps at the first row"
+        );
+    }
+
+    #[test]
+    fn settings_indicator_list_hit_test_covers_three_rows() {
+        let mut app = app_for_mouse_test();
+        open_settings_at(&mut app.state, SettingsSection::Indicators);
+        let area = app.state.settings_content_rect();
+        let list_y = area.y + 3;
+
+        assert_eq!(app.state.settings_list_index_at(area.x, list_y), Some(0));
+        assert_eq!(
+            app.state.settings_list_index_at(area.x, list_y + 2),
+            Some(2)
+        );
+        assert_eq!(app.state.settings_list_index_at(area.x, list_y + 3), None);
+    }
+
+    #[test]
+    fn settings_opens_indicators_on_the_animated_row_when_active() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.status_indicators = StatusIndicatorStyle::Animated;
+        open_settings_at(&mut state, SettingsSection::Indicators);
+        assert_eq!(state.settings.list.selected, 2);
     }
 }
