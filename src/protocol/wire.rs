@@ -645,6 +645,58 @@ pub struct TerminalFrame {
     pub bytes: Vec<u8>,
 }
 
+/// One replaced cell inside a client's retained frame.
+// Consumed by the later server frame-patch timer; exercised by tests until then.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellPatch {
+    /// Row-major index into `FrameData::cells` (`y * width + x`).
+    pub index: u32,
+    /// Replacement cell. Its `hyperlink` indexes the retained frame's table.
+    pub cell: CellData,
+}
+
+/// A sparse update to a client's most recent full frame.
+///
+/// Sent instead of a whole `FrameData` when only a few cells changed, such as
+/// the animated working indicator. `width` and `height` name the frame the
+/// patch applies to; a client drops patches whose geometry differs from its
+/// retained frame and waits for the next full frame.
+// Consumed by the later server frame-patch timer; exercised by tests until then.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FramePatch {
+    /// Width of the frame this patch applies to.
+    pub width: u16,
+    /// Height of the frame this patch applies to.
+    pub height: u16,
+    /// Replaced cells.
+    pub cells: Vec<CellPatch>,
+}
+
+impl FramePatch {
+    /// Writes the patched cells into `frame`. Returns `false` and leaves `frame`
+    /// untouched when the geometry differs or any index is out of range.
+    // Reached in production through the later server frame-patch timer.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn apply_to(&self, frame: &mut FrameData) -> bool {
+        if frame.width != self.width || frame.height != self.height {
+            return false;
+        }
+        if self
+            .cells
+            .iter()
+            .any(|patch| patch.index as usize >= frame.cells.len())
+        {
+            return false;
+        }
+        for patch in &self.cells {
+            frame.cells[patch.index as usize] = patch.cell.clone();
+        }
+        true
+    }
+}
+
 /// Notification kind forwarded from server to client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NotifyKind {
@@ -833,7 +885,7 @@ const UNDERLINE_STYLE_MASK: u16 = 0xF000;
 /// indicator cell in a rendered buffer. ratatui owns bits 0-8 and the underline
 /// style nibble owns bits 12-15; this bit is stripped by `modifier_to_u16`, so
 /// it never reaches the wire or a host terminal.
-pub const SPINNER_CELL: ratatui::style::Modifier =
+pub(crate) const SPINNER_CELL: ratatui::style::Modifier =
     ratatui::style::Modifier::from_bits_retain(1 << 11);
 
 /// Converts a ratatui `Modifier` bitmask to a u16 for wire transport.
@@ -2299,5 +2351,93 @@ mod tests {
             self.pos += to_read;
             Ok(to_read)
         }
+    }
+
+    fn patch_cell(symbol: &str) -> CellData {
+        CellData {
+            symbol: symbol.to_owned(),
+            fg: 0x02_FF_00_00,
+            bg: 0,
+            modifier: 0,
+            skip: false,
+            hyperlink: None,
+        }
+    }
+
+    fn patch_frame(width: u16, height: u16) -> FrameData {
+        FrameData {
+            cells: vec![patch_cell("A"); usize::from(width) * usize::from(height)],
+            width,
+            height,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn frame_patch_roundtrips_through_bincode() {
+        let patch = FramePatch {
+            width: 3,
+            height: 2,
+            cells: vec![CellPatch {
+                index: 4,
+                cell: patch_cell("⠋"),
+            }],
+        };
+        let encoded = bincode::serde::encode_to_vec(&patch, bincode::config::standard()).unwrap();
+        let (decoded, _): (FramePatch, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(patch, decoded);
+    }
+
+    #[test]
+    fn frame_patch_apply_replaces_cells_or_refuses_whole() {
+        let mut frame = patch_frame(3, 2);
+        let patch = FramePatch {
+            width: 3,
+            height: 2,
+            cells: vec![
+                CellPatch {
+                    index: 0,
+                    cell: patch_cell("B"),
+                },
+                CellPatch {
+                    index: 5,
+                    cell: patch_cell("C"),
+                },
+            ],
+        };
+        assert!(patch.apply_to(&mut frame));
+        assert_eq!(frame.cells[0].symbol, "B");
+        assert_eq!(frame.cells[5].symbol, "C");
+        assert_eq!(frame.cells[1].symbol, "A");
+
+        let mismatched = FramePatch {
+            width: 4,
+            height: 2,
+            cells: Vec::new(),
+        };
+        assert!(!mismatched.apply_to(&mut frame));
+
+        let out_of_range = FramePatch {
+            width: 3,
+            height: 2,
+            cells: vec![
+                CellPatch {
+                    index: 1,
+                    cell: patch_cell("X"),
+                },
+                CellPatch {
+                    index: 6,
+                    cell: patch_cell("Y"),
+                },
+            ],
+        };
+        assert!(!out_of_range.apply_to(&mut frame));
+        assert_eq!(
+            frame.cells[1].symbol, "A",
+            "a refused patch changes nothing"
+        );
     }
 }

@@ -138,6 +138,93 @@ impl BlitEncoder {
     pub(crate) fn last_frame(&self) -> Option<&FrameData> {
         self.last_frame.as_ref()
     }
+
+    /// Encodes a sparse patch against the retained frame as one synchronized
+    /// output block: sync begin, cursor hide, OSC 8 reset, the patched cells,
+    /// style reset, cursor restored while hidden, sync end. Returns `None` when
+    /// there is no retained frame, the geometry differs, or an index is out of
+    /// range; callers drop such patches and wait for the next full frame.
+    // Reached in production through the later server frame-patch timer.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn encode_patch(
+        &self,
+        patch: &crate::protocol::FramePatch,
+        suppress_visible_cursor: bool,
+    ) -> Option<EncodedBlit> {
+        let frame = self.last_frame.as_ref()?;
+        if frame.width != patch.width || frame.height != patch.height {
+            return None;
+        }
+        let width = usize::from(frame.width);
+        if width == 0
+            || patch
+                .cells
+                .iter()
+                .any(|cell| cell.index as usize >= frame.cells.len())
+        {
+            return None;
+        }
+
+        let mut bytes = Vec::new();
+        let mut next_last_visible_cursor = self.last_visible_cursor;
+        let mut next_last_cursor_shape = self.last_cursor_shape;
+
+        let _ = bytes.write_all(b"\x1b[?2026h");
+        let _ = bytes.write_all(b"\x1b[?25l");
+        let _ = bytes.write_all(b"\x1b]8;;\x1b\\");
+
+        let mut last_sgr = String::new();
+        let mut active_hyperlink = None;
+        for cell_patch in &patch.cells {
+            let idx = cell_patch.index as usize;
+            let position = ((idx % width) as u16, (idx / width) as u16);
+            write_cell(
+                &mut bytes,
+                Some(position),
+                &cell_patch.cell,
+                &mut last_sgr,
+                &mut active_hyperlink,
+                frame,
+            );
+        }
+        close_hyperlink(&mut bytes, &mut active_hyperlink);
+        if !last_sgr.is_empty() {
+            let _ = bytes.write_all(b"\x1b[0m");
+        }
+
+        let mut host_cursor = resolve_host_cursor_state(frame, &mut next_last_visible_cursor);
+        if suppress_visible_cursor && host_cursor.visible {
+            host_cursor.visible = false;
+        }
+        write_host_cursor_state(&mut bytes, host_cursor, &mut next_last_cursor_shape);
+        let _ = bytes.write_all(b"\x1b[?2026l");
+        if repeat_ime_anchor_after_sync() {
+            write_ime_anchor_cursor_state(&mut bytes, host_cursor);
+        }
+
+        Some(EncodedBlit {
+            bytes,
+            full: false,
+            next_last_visible_cursor,
+            next_last_cursor_shape,
+        })
+    }
+
+    /// Commits a patch previously produced by `encode_patch`, keeping the
+    /// retained frame and cursor memory in step with what the terminal shows.
+    // Reached in production through the later server frame-patch timer.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn commit_patch(
+        &mut self,
+        patch: &crate::protocol::FramePatch,
+        encoded: EncodedBlit,
+    ) {
+        self.last_visible_cursor = encoded.next_last_visible_cursor;
+        self.last_cursor_shape = encoded.next_last_cursor_shape;
+        if let Some(frame) = self.last_frame.as_mut() {
+            patch.apply_to(frame);
+        }
+    }
 }
 
 pub(crate) fn frame_with_drawn_cursor(mut frame: FrameData) -> FrameData {
@@ -1984,5 +2071,138 @@ mod tests {
             output_str.contains("\x1b[1;2H"),
             "cells hidden by a previous halfwidth voiced kana must be redrawn when visible"
         );
+    }
+
+    use crate::protocol::{CellPatch, FramePatch};
+
+    fn committed_encoder(frame: &FrameData) -> BlitEncoder {
+        let mut encoder = BlitEncoder::new();
+        let encoded = encoder.encode(frame, false);
+        encoder.commit(frame.clone(), encoded);
+        encoder
+    }
+
+    fn single_cell_patch(width: u16, height: u16, index: u32, symbol: &str) -> FramePatch {
+        FramePatch {
+            width,
+            height,
+            cells: vec![CellPatch {
+                index,
+                cell: make_cell(symbol, 0x02_FF_FF_00, 0, 0),
+            }],
+        }
+    }
+
+    #[test]
+    fn encode_patch_writes_only_patched_cells_inside_one_sync_block() {
+        let mut frame = make_frame(3, 3, vec![make_cell("A", 0, 0, 0); 9]);
+        frame.cursor = Some(CursorState {
+            x: 2,
+            y: 1,
+            visible: true,
+            shape: 0,
+        });
+        let encoder = committed_encoder(&frame);
+
+        let patch = single_cell_patch(3, 3, 4, "B");
+        let encoded = encoder
+            .encode_patch(&patch, false)
+            .expect("baseline present");
+        let output = String::from_utf8(encoded.bytes.clone()).unwrap();
+
+        assert!(!encoded.full);
+        assert!(output.starts_with("\x1b[?2026h\x1b[?25l\x1b]8;;\x1b\\"));
+        let paint = output.find("\x1b[2;2H").expect("CUP to the patched cell");
+        let glyph = output.find('B').expect("patched glyph");
+        assert!(paint < glyph);
+        assert_eq!(
+            output.matches('A').count(),
+            0,
+            "unpatched cells are not rewritten"
+        );
+        assert!(output.contains("\x1b[0m"), "style is reset after the cells");
+        let restore = output
+            .find("\x1b[2;3H\x1b[?25h")
+            .expect("cursor restored while hidden");
+        assert!(glyph < restore);
+        let sync_end = output.find("\x1b[?2026l").expect("sync end");
+        assert!(restore < sync_end);
+    }
+
+    #[test]
+    fn encode_patch_refuses_without_matching_baseline() {
+        let frame = make_frame(2, 2, vec![make_cell("A", 0, 0, 0); 4]);
+        let empty = BlitEncoder::new();
+        assert!(empty
+            .encode_patch(&single_cell_patch(2, 2, 0, "B"), false)
+            .is_none());
+
+        let encoder = committed_encoder(&frame);
+        assert!(encoder
+            .encode_patch(&single_cell_patch(3, 2, 0, "B"), false)
+            .is_none());
+        assert!(encoder
+            .encode_patch(&single_cell_patch(2, 2, 4, "B"), false)
+            .is_none());
+    }
+
+    #[test]
+    fn encode_patch_with_suppressed_cursor_never_shows_it() {
+        let mut frame = make_frame(2, 2, vec![make_cell("A", 0, 0, 0); 4]);
+        frame.cursor = Some(CursorState {
+            x: 0,
+            y: 0,
+            visible: true,
+            shape: 0,
+        });
+        let encoder = committed_encoder(&frame);
+        let encoded = encoder
+            .encode_patch(&single_cell_patch(2, 2, 3, "B"), true)
+            .unwrap();
+        let output = String::from_utf8(encoded.bytes).unwrap();
+        assert!(!output.contains("\x1b[?25h"));
+    }
+
+    #[test]
+    fn commit_patch_updates_the_baseline_for_the_next_full_diff() {
+        let frame = make_frame(2, 2, vec![make_cell("A", 0, 0, 0); 4]);
+        let mut encoder = committed_encoder(&frame);
+        let patch = single_cell_patch(2, 2, 1, "B");
+        let encoded = encoder.encode_patch(&patch, false).unwrap();
+        encoder.commit_patch(&patch, encoded);
+
+        assert_eq!(encoder.last_frame().unwrap().cells[1].symbol, "B");
+
+        let mut next = frame.clone();
+        next.cells[1] = make_cell("B", 0x02_FF_FF_00, 0, 0);
+        assert!(
+            encoder.is_current(&next),
+            "patched baseline equals the next full frame"
+        );
+        let diff = encoder.encode(&next, false);
+        let output = String::from_utf8(diff.bytes).unwrap();
+        assert!(!output.contains('B'), "nothing left to repaint");
+    }
+
+    #[test]
+    fn encode_patch_replays_the_glyph_into_the_right_terminal_cell() {
+        let frame = make_frame(4, 3, vec![make_cell("A", 0, 0, 0); 12]);
+        let mut terminal = crate::ghostty::Terminal::new(4, 3, 0).unwrap();
+        let mut encoder = BlitEncoder::new();
+        let initial = encoder.encode(&frame, false);
+        terminal.write(&initial.bytes);
+        encoder.commit(frame, initial);
+
+        let patch = single_cell_patch(4, 3, 6, "B"); // x=2, y=1
+        let encoded = encoder.encode_patch(&patch, false).unwrap();
+        terminal.write(&encoded.bytes);
+
+        for row in 0..3 {
+            for col in 0..4 {
+                let (_, graphemes) = terminal.screen_cell(col, row).unwrap();
+                let expected = if (col, row) == (2, 1) { 'B' } else { 'A' };
+                assert_eq!(graphemes, vec![u32::from(expected)], "cell ({col},{row})");
+            }
+        }
     }
 }
