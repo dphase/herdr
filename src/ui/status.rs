@@ -246,9 +246,15 @@ pub(super) fn state_icon(
     spinner_phase: u8,
     p: &Palette,
 ) -> (&'static str, Style) {
+    let mut style = Style::default().fg(state_label_color(state, seen, p));
+    if indicator_style == StatusIndicatorStyle::Animated && state == AgentState::Working {
+        // The server scans rendered buffers for this bit to learn which cells
+        // to patch on each spinner tick. It is stripped before cells hit the wire.
+        style = style.add_modifier(crate::protocol::SPINNER_CELL);
+    }
     (
         state_icon_symbol(state, seen, indicator_style, spinner_phase),
-        Style::default().fg(state_label_color(state, seen, p)),
+        style,
     )
 }
 
@@ -349,6 +355,52 @@ mod tests {
             );
             assert_eq!(symbol, "×");
         }
+    }
+
+    #[test]
+    fn only_the_animated_working_icon_carries_the_spinner_marker() {
+        let palette = Palette::catppuccin();
+        let marked = |style: StatusIndicatorStyle, state: AgentState, seen: bool| {
+            state_icon(state, seen, style, 0, &palette)
+                .1
+                .add_modifier
+                .contains(crate::protocol::SPINNER_CELL)
+        };
+        assert!(marked(
+            StatusIndicatorStyle::Animated,
+            AgentState::Working,
+            true
+        ));
+        assert!(!marked(
+            StatusIndicatorStyle::Symbols,
+            AgentState::Working,
+            true
+        ));
+        assert!(!marked(
+            StatusIndicatorStyle::Dots,
+            AgentState::Working,
+            true
+        ));
+        assert!(!marked(
+            StatusIndicatorStyle::Animated,
+            AgentState::Blocked,
+            true
+        ));
+        assert!(!marked(
+            StatusIndicatorStyle::Animated,
+            AgentState::Idle,
+            false
+        ));
+        assert!(!marked(
+            StatusIndicatorStyle::Animated,
+            AgentState::Idle,
+            true
+        ));
+        assert!(!marked(
+            StatusIndicatorStyle::Animated,
+            AgentState::Unknown,
+            true
+        ));
     }
 
     #[test]

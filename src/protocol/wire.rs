@@ -829,9 +829,16 @@ fn u32_to_color(val: u32) -> ratatui::style::Color {
 const UNDERLINE_STYLE_SHIFT: u16 = 12;
 const UNDERLINE_STYLE_MASK: u16 = 0xF000;
 
+/// Herdr-internal ratatui modifier bit that marks an animated working
+/// indicator cell in a rendered buffer. ratatui owns bits 0-8 and the underline
+/// style nibble owns bits 12-15; this bit is stripped by `modifier_to_u16`, so
+/// it never reaches the wire or a host terminal.
+pub const SPINNER_CELL: ratatui::style::Modifier =
+    ratatui::style::Modifier::from_bits_retain(1 << 11);
+
 /// Converts a ratatui `Modifier` bitmask to a u16 for wire transport.
 pub(crate) fn modifier_to_u16(modifier: ratatui::style::Modifier) -> u16 {
-    modifier.bits()
+    modifier.bits() & !SPINNER_CELL.bits()
 }
 
 pub(crate) fn underline_style_from_modifier(modifier: u16) -> u8 {
@@ -1131,6 +1138,30 @@ mod tests {
                 takeover: false,
             }),
             9
+        );
+    }
+
+    #[test]
+    fn spinner_cell_marker_never_reaches_the_wire() {
+        use ratatui::style::Modifier;
+
+        assert_eq!(
+            SPINNER_CELL.bits() & Modifier::all().bits(),
+            0,
+            "marker must not overlap a ratatui modifier"
+        );
+        assert_eq!(
+            SPINNER_CELL.bits() & UNDERLINE_STYLE_MASK,
+            0,
+            "marker must not overlap the underline style nibble"
+        );
+        assert_eq!(
+            modifier_to_u16(Modifier::BOLD | SPINNER_CELL),
+            Modifier::BOLD.bits()
+        );
+        assert!(
+            !modifier_with_underline_style(Modifier::all(), 0x0F).contains(SPINNER_CELL),
+            "pane styles never produce the marker"
         );
     }
 

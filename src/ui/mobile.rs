@@ -1177,6 +1177,20 @@ fn agent_summary_line(app: &AppState, p: &Palette, max_width: u16) -> Line<'stat
             Style::default().fg(p.overlay1).bg(p.panel_bg)
         };
         used += text.chars().count();
+        // Under the animated style the working segment starts with the spinner
+        // glyph. Emit that glyph as its own marked span so the server patches it
+        // along with the header dot.
+        if tone == SummaryTone::Working && app.status_indicators == StatusIndicatorStyle::Animated {
+            let glyph = crate::ui::spinner_frame(app.spinner_phase);
+            if let Some(rest) = text.strip_prefix(glyph) {
+                spans.push(Span::styled(
+                    glyph,
+                    style.add_modifier(crate::protocol::SPINNER_CELL),
+                ));
+                spans.push(Span::styled(rest.to_string(), style));
+                continue;
+            }
+        }
         spans.push(Span::styled(text, style));
     }
     if truncated && used + 2 <= max_width as usize {
@@ -1363,6 +1377,48 @@ mod tests {
         assert_eq!(
             terminal.backend().buffer()[(area.width - 1, 0)].symbol(),
             "×"
+        );
+    }
+
+    #[test]
+    fn animated_mobile_header_marks_the_dot_and_summary_glyph() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![crate::workspace::Workspace::test_new("spin")];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.status_indicators = StatusIndicatorStyle::Animated;
+        let pane_id = app.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal_state = app.terminals.get_mut(&terminal_id).unwrap();
+        terminal_state.detected_agent = Some(crate::detect::Agent::Claude);
+        terminal_state.state = AgentState::Working;
+
+        let area = Rect::new(0, 0, 44, 2);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                .unwrap();
+        terminal
+            .draw(|frame| render_header_status(&app, &TerminalRuntimeRegistry::new(), frame, area))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let marked: Vec<(u16, u16)> = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                buffer[(x, y)]
+                    .modifier
+                    .contains(crate::protocol::SPINNER_CELL)
+            })
+            .collect();
+        assert_eq!(marked, vec![(1, 0), (1, 1)], "header dot and summary glyph");
+        assert_eq!(buffer[(1, 0)].symbol(), "⠋");
+        assert_eq!(buffer[(1, 1)].symbol(), "⠋");
+        assert_eq!(
+            buffer[(3, 1)].symbol(),
+            "1",
+            "summary text follows the glyph"
         );
     }
 

@@ -345,6 +345,23 @@ pub(crate) fn render_virtual_with_runtime_registry(
     (buffer, cursor)
 }
 
+/// Row-major indices (`y * width + x`) of every cell in `buffer` that carries
+/// the animated working indicator marker. Only called when the indicator style
+/// is `Animated`; static styles never set the marker.
+// The production caller is the server spinner tick that patches these cells; it
+// lands in a follow-up task, so for now this is exercised only by the
+// buffer-scan tests below.
+#[allow(dead_code)]
+pub(crate) fn collect_spinner_cells(buffer: &ratatui::buffer::Buffer) -> Vec<u32> {
+    buffer
+        .content()
+        .iter()
+        .enumerate()
+        .filter(|(_, cell)| cell.modifier.contains(crate::protocol::SPINNER_CELL))
+        .map(|(index, _)| index as u32)
+        .collect()
+}
+
 fn popup_terminal_cursor(
     app_state: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -635,5 +652,84 @@ mod render_scale_benchmark {
             "active panes (one workspace)",
             profile_cardinalities(app_with_active_panes),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app_with_working_pane(style: crate::config::StatusIndicatorStyle) -> AppState {
+        let mut app = AppState::test_new();
+        app.workspaces = vec![crate::workspace::Workspace::test_new("spin")];
+        app.ensure_test_terminals();
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.status_indicators = style;
+        let pane_id = app.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&terminal_id).expect("test terminal");
+        terminal.detected_agent = Some(crate::detect::Agent::Pi);
+        terminal.state = crate::detect::AgentState::Working;
+        app
+    }
+
+    #[test]
+    fn collect_spinner_cells_finds_every_animated_working_glyph() {
+        let mut app = app_with_working_pane(crate::config::StatusIndicatorStyle::Animated);
+        let area = Rect::new(0, 0, 80, 24);
+        let (buffer, cursor) = render_virtual(&mut app, area, true);
+
+        let cells = collect_spinner_cells(&buffer);
+        // Default sidebar rows: one state icon on the workspace card, one on the
+        // agent row.
+        assert_eq!(cells.len(), 2, "cells: {cells:?}");
+        let frame = FrameData::from_ratatui_buffer(&buffer, cursor);
+        for index in &cells {
+            let cell = &frame.cells[*index as usize];
+            assert_eq!(cell.symbol, crate::ui::spinner_frame(0));
+            assert_eq!(
+                cell.modifier & crate::protocol::SPINNER_CELL.bits(),
+                0,
+                "marker is stripped from wire cells"
+            );
+        }
+    }
+
+    #[test]
+    fn collect_spinner_cells_is_empty_for_static_styles() {
+        for style in [
+            crate::config::StatusIndicatorStyle::Dots,
+            crate::config::StatusIndicatorStyle::Symbols,
+        ] {
+            let mut app = app_with_working_pane(style);
+            let (buffer, _) = render_virtual(&mut app, Rect::new(0, 0, 80, 24), true);
+            assert!(collect_spinner_cells(&buffer).is_empty());
+        }
+    }
+
+    #[test]
+    fn collect_spinner_cells_ignores_braille_in_titles() {
+        let mut app = app_with_working_pane(crate::config::StatusIndicatorStyle::Animated);
+        app.workspaces[0].set_custom_name("⠋ ◐ ⠙ braille title".to_string());
+        let (buffer, _) = render_virtual(&mut app, Rect::new(0, 0, 80, 24), true);
+        assert_eq!(
+            collect_spinner_cells(&buffer).len(),
+            2,
+            "braille and the static working glyph in a workspace name are text, not spinner cells"
+        );
+    }
+
+    #[test]
+    fn collect_spinner_cells_finds_collapsed_sidebar_glyphs() {
+        let mut app = app_with_working_pane(crate::config::StatusIndicatorStyle::Animated);
+        app.sidebar_collapsed = true;
+        let (buffer, _) = render_virtual(&mut app, Rect::new(0, 0, 80, 24), true);
+        // Collapsed rows: one icon on the workspace row and one on the agent
+        // detail row.
+        assert_eq!(collect_spinner_cells(&buffer).len(), 2);
     }
 }
