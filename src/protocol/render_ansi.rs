@@ -144,8 +144,6 @@ impl BlitEncoder {
     /// style reset, cursor restored while hidden, sync end. Returns `None` when
     /// there is no retained frame, the geometry differs, or an index is out of
     /// range; callers drop such patches and wait for the next full frame.
-    // Reached in production through the later server frame-patch timer.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn encode_patch(
         &self,
         patch: &crate::protocol::FramePatch,
@@ -212,8 +210,6 @@ impl BlitEncoder {
 
     /// Commits a patch previously produced by `encode_patch`, keeping the
     /// retained frame and cursor memory in step with what the terminal shows.
-    // Reached in production through the later server frame-patch timer.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn commit_patch(
         &mut self,
         patch: &crate::protocol::FramePatch,

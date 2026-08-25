@@ -487,6 +487,21 @@ fn should_draw_host_cursor(mode: crate::config::HostCursorModeConfig) -> bool {
     }
 }
 
+/// Encodes a server frame patch against the client's retained frame, or `None`
+/// when a repaint is pending (the next full frame resynchronizes the surface)
+/// or the encoder has no matching baseline.
+fn encode_frame_patch(
+    encoder: &render_ansi::BlitEncoder,
+    repaint_pending: bool,
+    draw_host_cursor: bool,
+    patch: &protocol::FramePatch,
+) -> Option<render_ansi::EncodedBlit> {
+    if repaint_pending {
+        return None;
+    }
+    encoder.encode_patch(patch, draw_host_cursor)
+}
+
 #[cfg(windows)]
 #[derive(Default)]
 struct WindowsVirtualTerminalInputSetup {
@@ -1716,6 +1731,19 @@ async fn run_client_loop(
                     let _ = stdout.flush();
                     state.blit_encoder.commit(frame_data, encoded);
                     state.repaint_pending = false;
+                }
+                ServerMessage::FramePatch(patch) => {
+                    if let Some(encoded) = encode_frame_patch(
+                        &state.blit_encoder,
+                        state.repaint_pending,
+                        state.draw_host_cursor,
+                        &patch,
+                    ) {
+                        let mut stdout = io::stdout();
+                        let _ = stdout.write_all(&encoded.bytes);
+                        let _ = stdout.flush();
+                        state.blit_encoder.commit_patch(&patch, encoded);
+                    }
                 }
                 ServerMessage::Terminal(frame) => {
                     if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {
@@ -2979,6 +3007,53 @@ mod tests {
         write_encoded_frame_with_graphics(&mut output, b"text", b"").unwrap();
 
         assert_eq!(output, b"text");
+    }
+
+    #[test]
+    fn encode_frame_patch_waits_for_a_baseline_and_skips_pending_repaints() {
+        use crate::protocol::{CellData, CellPatch, FrameData, FramePatch};
+
+        let cell = |symbol: &str| CellData {
+            symbol: symbol.to_owned(),
+            fg: 0,
+            bg: 0,
+            modifier: 0,
+            skip: false,
+            hyperlink: None,
+        };
+        let frame = FrameData {
+            cells: vec![cell("A"); 4],
+            width: 2,
+            height: 2,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        let patch = FramePatch {
+            width: 2,
+            height: 2,
+            cells: vec![CellPatch {
+                index: 3,
+                cell: cell("⠙"),
+            }],
+        };
+
+        let mut encoder = render_ansi::BlitEncoder::new();
+        assert!(
+            encode_frame_patch(&encoder, false, false, &patch).is_none(),
+            "no baseline yet"
+        );
+
+        let initial = encoder.encode(&frame, false);
+        encoder.commit(frame, initial);
+        assert!(
+            encode_frame_patch(&encoder, true, false, &patch).is_none(),
+            "repaint pending"
+        );
+
+        let encoded = encode_frame_patch(&encoder, false, false, &patch).expect("baseline present");
+        encoder.commit_patch(&patch, encoded);
+        assert_eq!(encoder.last_frame().unwrap().cells[3].symbol, "⠙");
     }
 
     #[test]

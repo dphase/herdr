@@ -646,8 +646,6 @@ pub struct TerminalFrame {
 }
 
 /// One replaced cell inside a client's retained frame.
-// Consumed by the later server frame-patch timer; exercised by tests until then.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellPatch {
     /// Row-major index into `FrameData::cells` (`y * width + x`).
@@ -662,8 +660,6 @@ pub struct CellPatch {
 /// the animated working indicator. `width` and `height` name the frame the
 /// patch applies to; a client drops patches whose geometry differs from its
 /// retained frame and waits for the next full frame.
-// Consumed by the later server frame-patch timer; exercised by tests until then.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FramePatch {
     /// Width of the frame this patch applies to.
@@ -677,8 +673,6 @@ pub struct FramePatch {
 impl FramePatch {
     /// Writes the patched cells into `frame`. Returns `false` and leaves `frame`
     /// untouched when the geometry differs or any index is out of range.
-    // Reached in production through the later server frame-patch timer.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn apply_to(&self, frame: &mut FrameData) -> bool {
         if frame.width != self.width || frame.height != self.height {
             return false;
@@ -805,6 +799,9 @@ pub enum ServerMessage {
 
     /// Suppress a direct command that expired before terminal delivery.
     GraphicsTransmissionRetired { transfer_id: u64, image_id: u32 },
+
+    /// Sparse cell update for a semantic-frame client's retained frame.
+    FramePatch(FramePatch),
 }
 
 // ---------------------------------------------------------------------------
@@ -1267,7 +1264,7 @@ mod tests {
             ],
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
-        // Freeze the protocol 20 input envelope before it is published.
+        // Freeze the protocol 21 input envelope before it is published.
         assert_eq!(
             encoded,
             vec![
@@ -2439,5 +2436,60 @@ mod tests {
             frame.cells[1].symbol, "A",
             "a refused patch changes nothing"
         );
+    }
+
+    #[test]
+    fn server_frame_patch_roundtrip() {
+        let msg = ServerMessage::FramePatch(FramePatch {
+            width: 80,
+            height: 24,
+            cells: vec![CellPatch {
+                index: 81,
+                cell: patch_cell("⠙"),
+            }],
+        });
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ServerMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn server_message_wire_tags_preserve_protocol_21_order() {
+        fn tag(msg: &ServerMessage) -> u8 {
+            *bincode::serde::encode_to_vec(msg, bincode::config::standard())
+                .unwrap()
+                .first()
+                .expect("encoded server message should include enum tag")
+        }
+
+        assert_eq!(tag(&ServerMessage::Frame(patch_frame(1, 1))), 1);
+        assert_eq!(
+            tag(&ServerMessage::Terminal(TerminalFrame {
+                seq: 1,
+                width: 1,
+                height: 1,
+                full: true,
+                bytes: Vec::new(),
+            })),
+            2
+        );
+        assert_eq!(
+            tag(&ServerMessage::GraphicsTransmissionRetired {
+                transfer_id: 1,
+                image_id: 1,
+            }),
+            14
+        );
+        assert_eq!(
+            tag(&ServerMessage::FramePatch(FramePatch {
+                width: 1,
+                height: 1,
+                cells: Vec::new(),
+            })),
+            15,
+            "FramePatch is appended so existing tags do not move"
+        );
+        assert_eq!(PROTOCOL_VERSION, 21);
     }
 }
