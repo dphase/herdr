@@ -38,6 +38,8 @@ use std::time::{Duration, Instant};
 
 const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
 pub(crate) const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
+/// Cadence of the animated working indicator (the 0.7.5 headless cadence).
+pub(crate) const SPINNER_INTERVAL: Duration = Duration::from_millis(128);
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 const GIT_REPO_DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -130,6 +132,10 @@ pub struct App {
     pub(crate) last_pane_click: Option<PaneClickState>,
     pub(crate) pending_url_click_sources: HashSet<InputSourceId>,
     pub(crate) next_resize_poll: Instant,
+    /// Next animated-indicator tick. `None` unless the style is `Animated`, at
+    /// least one attached client has spinner cells, and no overlay blocks
+    /// retained-frame patches.
+    pub(crate) next_spinner_tick: Option<Instant>,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
     pub(crate) update_version_check_enabled: bool,
@@ -783,6 +789,7 @@ impl App {
             last_pane_click: None,
             pending_url_click_sources: HashSet::new(),
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
+            next_spinner_tick: None,
             next_auto_update_check: version_check_enabled
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             next_agent_manifest_update_check: manifest_check_enabled
@@ -5032,12 +5039,96 @@ mod tests {
         app.toast_deadline = None;
         app.next_auto_update_check = None;
         app.session_save_deadline = None;
+        app.next_spinner_tick = None;
         app.state.workspaces.clear();
 
         assert_eq!(
             app.next_headless_loop_deadline_with_git_refresh(now, false, true),
             None
         );
+    }
+
+    #[test]
+    fn spinner_timer_arms_only_for_animated_style_with_cells_and_gate() {
+        let mut app = test_app();
+        let now = Instant::now();
+
+        app.sync_spinner_timer(now, true, true);
+        assert_eq!(app.next_spinner_tick, None, "dots never animate");
+
+        app.state.status_indicators = crate::config::StatusIndicatorStyle::Symbols;
+        app.sync_spinner_timer(now, true, true);
+        assert_eq!(app.next_spinner_tick, None, "symbols never animate");
+
+        app.state.status_indicators = crate::config::StatusIndicatorStyle::Animated;
+        app.sync_spinner_timer(now, false, true);
+        assert_eq!(app.next_spinner_tick, None, "no spinner cells, no timer");
+
+        app.sync_spinner_timer(now, true, false);
+        assert_eq!(app.next_spinner_tick, None, "overlay gate closed, no timer");
+
+        app.sync_spinner_timer(now, true, true);
+        assert_eq!(app.next_spinner_tick, Some(now + SPINNER_INTERVAL));
+
+        let later = now + Duration::from_millis(40);
+        app.sync_spinner_timer(later, true, true);
+        assert_eq!(
+            app.next_spinner_tick,
+            Some(now + SPINNER_INTERVAL),
+            "re-syncing keeps the armed deadline"
+        );
+
+        app.sync_spinner_timer(later, false, true);
+        assert_eq!(app.next_spinner_tick, None);
+    }
+
+    #[test]
+    fn spinner_tick_advances_phase_and_reschedules() {
+        let mut app = test_app();
+        let now = Instant::now();
+        app.state.spinner_phase = 9;
+        app.next_spinner_tick = Some(now);
+
+        assert!(app.spinner_tick_due(now));
+        app.advance_spinner_phase(now);
+        assert_eq!(app.state.spinner_phase, 0, "phase wraps");
+        assert_eq!(app.next_spinner_tick, Some(now + SPINNER_INTERVAL));
+        assert!(!app.spinner_tick_due(now));
+    }
+
+    #[test]
+    fn headless_next_loop_deadline_includes_spinner_tick() {
+        let mut app = test_app();
+        let now = Instant::now();
+        app.next_resize_poll = now + Duration::from_secs(5);
+        app.session_save_deadline = Some(now + Duration::from_secs(2));
+        app.next_spinner_tick = Some(now + Duration::from_millis(128));
+
+        assert_eq!(
+            app.next_headless_loop_deadline_with_git_refresh(now, false, true),
+            app.next_spinner_tick
+        );
+    }
+
+    #[test]
+    fn spinner_patch_gate_matches_retained_update_gate_plus_diagnostic() {
+        let mut app = test_app();
+        app.state.mode = Mode::Terminal;
+        assert!(app.spinner_patch_allowed());
+
+        app.state.config_diagnostic = Some("banner".into());
+        assert!(!app.spinner_patch_allowed());
+        app.state.config_diagnostic = None;
+
+        app.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::Finished,
+            title: "done".into(),
+            context: String::new(),
+            position: None,
+            target: None,
+        });
+        assert!(!app.spinner_patch_allowed());
+        assert!(!app.retained_update_allowed_by_state());
     }
 
     #[test]

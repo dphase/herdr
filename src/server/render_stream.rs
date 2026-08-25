@@ -12,44 +12,82 @@ use crate::terminal::TerminalRuntimeRegistry;
 /// Per-client render baseline for the negotiated render encoding.
 pub(crate) enum ClientRenderState {
     /// Semantic clients compare full frame data and skip identical frames.
-    Semantic { last_frame: Option<FrameData> },
+    Semantic {
+        last_frame: Option<FrameData>,
+        /// Row-major indices of animated working glyphs in `last_frame`.
+        spinner_cells: Vec<u32>,
+    },
     /// Terminal-ANSI clients keep a terminal diff encoder and sequence number.
     TerminalAnsi {
         blit_encoder: BlitEncoder,
         seq: u64,
         repaint_pending: bool,
+        /// Row-major indices of animated working glyphs in the encoder's frame.
+        spinner_cells: Vec<u32>,
     },
 }
 
 impl ClientRenderState {
     pub(crate) fn new(render_encoding: RenderEncoding) -> Self {
         match render_encoding {
-            RenderEncoding::SemanticFrame => Self::Semantic { last_frame: None },
+            RenderEncoding::SemanticFrame => Self::Semantic {
+                last_frame: None,
+                spinner_cells: Vec::new(),
+            },
             RenderEncoding::TerminalAnsi => Self::TerminalAnsi {
                 blit_encoder: BlitEncoder::new(),
                 seq: 0,
                 repaint_pending: false,
+                spinner_cells: Vec::new(),
             },
         }
     }
 
     pub(crate) fn reset_baseline(&mut self) {
         match self {
-            Self::Semantic { last_frame } => *last_frame = None,
+            Self::Semantic {
+                last_frame,
+                spinner_cells,
+            } => {
+                *last_frame = None;
+                spinner_cells.clear();
+            }
             Self::TerminalAnsi {
                 blit_encoder,
                 repaint_pending,
+                spinner_cells,
                 ..
             } => {
                 *blit_encoder = BlitEncoder::new();
                 *repaint_pending = false;
+                spinner_cells.clear();
             }
         }
     }
 
+    pub(crate) fn set_spinner_cells(&mut self, cells: Vec<u32>) {
+        match self {
+            Self::Semantic { spinner_cells, .. } | Self::TerminalAnsi { spinner_cells, .. } => {
+                *spinner_cells = cells;
+            }
+        }
+    }
+
+    pub(crate) fn spinner_cells(&self) -> &[u32] {
+        match self {
+            Self::Semantic { spinner_cells, .. } | Self::TerminalAnsi { spinner_cells, .. } => {
+                spinner_cells
+            }
+        }
+    }
+
+    pub(crate) fn has_spinner_cells(&self) -> bool {
+        !self.spinner_cells().is_empty()
+    }
+
     pub(crate) fn request_repaint(&mut self) {
         match self {
-            Self::Semantic { last_frame } => *last_frame = None,
+            Self::Semantic { last_frame, .. } => *last_frame = None,
             Self::TerminalAnsi {
                 repaint_pending, ..
             } => *repaint_pending = true,
@@ -57,14 +95,14 @@ impl ClientRenderState {
     }
 
     pub(crate) fn reset_semantic_input_baseline(&mut self) {
-        if let Self::Semantic { last_frame } = self {
+        if let Self::Semantic { last_frame, .. } = self {
             *last_frame = None;
         }
     }
 
     pub(crate) fn prepare_frame(&mut self, frame: FrameData) -> Option<PreparedRender> {
         match self {
-            Self::Semantic { last_frame } => {
+            Self::Semantic { last_frame, .. } => {
                 if last_frame.as_ref() == Some(&frame) {
                     crate::render_prof::event("prepare_frame.semantic.skip_current");
                     return None;
@@ -78,6 +116,7 @@ impl ClientRenderState {
                 blit_encoder,
                 seq,
                 repaint_pending,
+                ..
             } => {
                 if !*repaint_pending && blit_encoder.is_current(&frame) {
                     crate::render_prof::event("prepare_frame.ansi.skip_current");
@@ -113,7 +152,7 @@ impl ClientRenderState {
 
     pub(crate) fn last_frame(&self) -> Option<&FrameData> {
         match self {
-            Self::Semantic { last_frame } => last_frame.as_ref(),
+            Self::Semantic { last_frame, .. } => last_frame.as_ref(),
             Self::TerminalAnsi { blit_encoder, .. } => blit_encoder.last_frame(),
         }
     }
@@ -121,7 +160,7 @@ impl ClientRenderState {
     pub(crate) fn commit_sent_frame(&mut self, prepared: PreparedRender) {
         match (self, prepared) {
             (
-                Self::Semantic { last_frame },
+                Self::Semantic { last_frame, .. },
                 PreparedRender::Semantic {
                     message: ServerMessage::Frame(frame),
                 },
@@ -131,6 +170,7 @@ impl ClientRenderState {
                     blit_encoder,
                     seq,
                     repaint_pending,
+                    ..
                 },
                 PreparedRender::TerminalAnsi {
                     frame,
@@ -348,10 +388,6 @@ pub(crate) fn render_virtual_with_runtime_registry(
 /// Row-major indices (`y * width + x`) of every cell in `buffer` that carries
 /// the animated working indicator marker. Only called when the indicator style
 /// is `Animated`; static styles never set the marker.
-// The production caller is the server spinner tick that patches these cells; it
-// lands in a follow-up task, so for now this is exercised only by the
-// buffer-scan tests below.
-#[allow(dead_code)]
 pub(crate) fn collect_spinner_cells(buffer: &ratatui::buffer::Buffer) -> Vec<u32> {
     buffer
         .content()
@@ -731,5 +767,21 @@ mod tests {
         // Collapsed rows: one icon on the workspace row and one on the agent
         // detail row.
         assert_eq!(collect_spinner_cells(&buffer).len(), 2);
+    }
+
+    #[test]
+    fn client_render_state_stores_spinner_cells_for_both_encodings() {
+        for encoding in [RenderEncoding::SemanticFrame, RenderEncoding::TerminalAnsi] {
+            let mut state = ClientRenderState::new(encoding);
+            assert!(!state.has_spinner_cells());
+            state.set_spinner_cells(vec![3, 90]);
+            assert_eq!(state.spinner_cells(), &[3, 90]);
+            assert!(state.has_spinner_cells());
+            state.reset_baseline();
+            assert!(
+                !state.has_spinner_cells(),
+                "a reset baseline forgets its cells"
+            );
+        }
     }
 }

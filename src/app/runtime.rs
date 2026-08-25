@@ -7,7 +7,7 @@ use crossterm::terminal;
 
 use super::{
     background_update_check_enabled, App, AUTO_UPDATE_CHECK_INTERVAL, MIN_RENDER_INTERVAL,
-    RESIZE_POLL_INTERVAL, SELECTION_AUTOSCROLL_INTERVAL,
+    RESIZE_POLL_INTERVAL, SELECTION_AUTOSCROLL_INTERVAL, SPINNER_INTERVAL,
 };
 fn retain_detached_process_after_wait(
     pid: u32,
@@ -550,6 +550,61 @@ impl App {
         }
     }
 
+    /// True while no overlay can cover cells that a retained-frame update would
+    /// patch: terminal mode with no popup, selection, copy mode, context menu,
+    /// toast, copy feedback, or pending full redraw.
+    pub(crate) fn retained_update_allowed_by_state(&self) -> bool {
+        self.state.mode == super::Mode::Terminal
+            && self.state.popup_pane.is_none()
+            && self.state.selection.is_none()
+            && self.state.copy_mode.is_none()
+            && self.state.context_menu.is_none()
+            && self.state.toast.is_none()
+            && self.state.copy_feedback.is_none()
+            && !self.full_redraw_pending
+    }
+
+    /// Spinner patches additionally wait out the config diagnostic banner,
+    /// which is drawn over the whole frame on desktop layouts.
+    pub(crate) fn spinner_patch_allowed(&self) -> bool {
+        self.retained_update_allowed_by_state() && self.state.config_diagnostic.is_none()
+    }
+
+    /// Arms the spinner timer when animation is on, some attached client holds
+    /// spinner cells, and patches are allowed; disarms it otherwise. Keeps an
+    /// already-armed deadline so re-syncing after every full render does not
+    /// stretch the cadence.
+    pub(crate) fn sync_spinner_timer(
+        &mut self,
+        now: Instant,
+        has_spinner_cells: bool,
+        patch_allowed: bool,
+    ) {
+        let animate = self.state.status_indicators == crate::config::StatusIndicatorStyle::Animated;
+        if animate && has_spinner_cells && patch_allowed {
+            self.next_spinner_tick.get_or_insert(now + SPINNER_INTERVAL);
+        } else {
+            self.next_spinner_tick = None;
+        }
+    }
+
+    // The production consumer is the headless server's spinner tick that reads
+    // these to fire and reschedule a patch; it lands in a follow-up task, so for
+    // now they are exercised only by the App timer tests.
+    #[allow(dead_code)]
+    pub(crate) fn spinner_tick_due(&self, now: Instant) -> bool {
+        self.next_spinner_tick
+            .is_some_and(|deadline| now >= deadline)
+    }
+
+    /// Advances to the next spinner frame and schedules the following tick.
+    #[allow(dead_code)]
+    pub(crate) fn advance_spinner_phase(&mut self, now: Instant) {
+        let frames = crate::ui::SPINNER_FRAMES.len() as u8;
+        self.state.spinner_phase = (self.state.spinner_phase + 1) % frames;
+        self.next_spinner_tick = Some(now + SPINNER_INTERVAL);
+    }
+
     pub(crate) fn run_auto_update_check(&mut self) {
         if !background_update_check_enabled(self.no_session, self.update_version_check_enabled) {
             self.next_auto_update_check = None;
@@ -627,6 +682,7 @@ impl App {
             self.session_save_deadline,
             self.selection_autoscroll_deadline,
             self.selection_highlight_clear_deadline,
+            self.next_spinner_tick,
             self.next_tab_bar_status_deadline(),
             render_deadline,
         ]

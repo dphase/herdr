@@ -1599,6 +1599,18 @@ impl HeadlessServer {
         self.app_client_count() > 0
     }
 
+    /// Re-evaluates the animated indicator timer from the clients' recorded
+    /// spinner cells. Called after every full render and after every tick.
+    fn sync_spinner_timer(&mut self, now: Instant) {
+        let has_spinner_cells = self
+            .clients
+            .values()
+            .any(|client| client.render_state.has_spinner_cells());
+        let patch_allowed = self.app.spinner_patch_allowed();
+        self.app
+            .sync_spinner_timer(now, has_spinner_cells, patch_allowed);
+    }
+
     fn remove_client(&mut self, client_id: u64) -> bool {
         self.retire_direct_graphics_for_client(client_id);
         let was_foreground = self.foreground_client_id == Some(client_id);
@@ -4343,14 +4355,7 @@ impl HeadlessServer {
     }
 
     fn retained_pty_update_allowed_by_app_state(&self) -> bool {
-        self.app.state.mode == app::Mode::Terminal
-            && self.app.state.popup_pane.is_none()
-            && self.app.state.selection.is_none()
-            && self.app.state.copy_mode.is_none()
-            && self.app.state.context_menu.is_none()
-            && self.app.state.toast.is_none()
-            && self.app.state.copy_feedback.is_none()
-            && !self.app.full_redraw_pending
+        self.app.retained_update_allowed_by_state()
     }
 
     fn send_retained_frame_to_client(
@@ -4452,15 +4457,18 @@ impl HeadlessServer {
                 cols,
                 rows, resize_panes, "rendered virtual frame with no attached clients"
             );
+            self.sync_spinner_timer(Instant::now());
             return;
         }
 
+        let animated =
+            self.app.state.status_indicators == crate::config::StatusIndicatorStyle::Animated;
         let mut broken_clients: Vec<u64> = Vec::new();
         let mut deferred_frame = false;
         for (client_id, (cols, rows), cell_size, is_foreground, mode) in render_targets {
             let area = Rect::new(0, 0, cols, rows);
             let is_app_client = matches!(mode, ClientConnectionMode::App);
-            let mut frame = match mode {
+            let (mut frame, spinner_cells) = match mode {
                 ClientConnectionMode::App => {
                     let render_started = crate::render_prof::timer();
                     let render_cell_size =
@@ -4509,7 +4517,12 @@ impl HeadlessServer {
                         &hyperlinks,
                     );
                     crate::render_prof::duration_since("full_render.frame_build", frame_started);
-                    frame
+                    let spinner_cells = if animated {
+                        crate::server::render_stream::collect_spinner_cells(&buffer)
+                    } else {
+                        Vec::new()
+                    };
+                    (frame, spinner_cells)
                 }
                 ClientConnectionMode::TerminalAttach { terminal_id }
                 | ClientConnectionMode::TerminalObserve { terminal_id } => {
@@ -4545,7 +4558,7 @@ impl HeadlessServer {
                         &hyperlinks,
                     );
                     crate::render_prof::duration_since("full_render.frame_build", frame_started);
-                    frame
+                    (frame, Vec::new())
                 }
             };
 
@@ -4609,6 +4622,7 @@ impl HeadlessServer {
             }
             let has_graphics = !frame.graphics.is_empty();
             let Some(mut prepared) = client.render_state.prepare_frame(frame) else {
+                client.render_state.set_spinner_cells(spinner_cells);
                 if commit_graphics_cache {
                     client.graphics_cache = next_graphics_cache;
                     client.graphics_surface_reset_pending = false;
@@ -4682,6 +4696,7 @@ impl HeadlessServer {
                         client.graphics_surface_reset_pending = false;
                     }
                     client.render_state.commit_sent_frame(prepared);
+                    client.render_state.set_spinner_cells(spinner_cells);
                     if encoded.incomplete {
                         client.defer_full_render();
                         deferred_frame = true;
@@ -4710,6 +4725,7 @@ impl HeadlessServer {
         if !deferred_frame {
             self.app.full_redraw_pending = false;
         }
+        self.sync_spinner_timer(Instant::now());
         crate::render_prof::duration_since("full_render.total", full_started);
         debug!(cols, rows, foreground_client_id = ?self.foreground_client_id, "rendered virtual frame(s)");
     }
@@ -6040,6 +6056,68 @@ mod tests {
         server.resize_shared_runtime_to_effective_size();
 
         (server, client_rx, pane_id)
+    }
+
+    fn set_first_test_pane_working(server: &mut HeadlessServer) {
+        server.app.state.ensure_test_terminals();
+        let pane_id = server.app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = server.app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let terminal = server
+            .app
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("test terminal");
+        terminal.detected_agent = Some(crate::detect::Agent::Pi);
+        terminal.state = crate::detect::AgentState::Working;
+    }
+
+    #[tokio::test]
+    async fn render_and_stream_records_spinner_cells_and_arms_the_timer() {
+        let (mut server, client_rx, _) = retained_test_server(b"hello");
+        set_first_test_pane_working(&mut server);
+        server.app.state.status_indicators = crate::config::StatusIndicatorStyle::Animated;
+
+        server.render_and_stream();
+        let frame = read_server_frame(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial frame"),
+        );
+
+        let cells = server.clients[&1].render_state.spinner_cells().to_vec();
+        // Default sidebar rows: one state icon on the workspace card, one on the
+        // agent row.
+        assert_eq!(cells.len(), 2, "cells: {cells:?}");
+        for index in &cells {
+            assert_eq!(
+                frame.cells[*index as usize].symbol,
+                crate::ui::spinner_frame(0)
+            );
+        }
+        assert!(server.app.next_spinner_tick.is_some(), "timer armed");
+    }
+
+    #[tokio::test]
+    async fn render_and_stream_leaves_timer_off_for_static_styles() {
+        for style in [
+            crate::config::StatusIndicatorStyle::Dots,
+            crate::config::StatusIndicatorStyle::Symbols,
+        ] {
+            let (mut server, client_rx, _) = retained_test_server(b"hello");
+            set_first_test_pane_working(&mut server);
+            server.app.state.status_indicators = style;
+
+            server.render_and_stream();
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial frame");
+
+            assert!(!server.clients[&1].render_state.has_spinner_cells());
+            assert_eq!(server.app.next_spinner_tick, None);
+        }
     }
 
     fn hidden_pty_visibility_test_server(
