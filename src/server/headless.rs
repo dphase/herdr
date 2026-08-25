@@ -704,6 +704,7 @@ impl HeadlessServer {
             self.sync_immediate_pty_sources();
             self.stream_host_mouse_capture_mode();
             self.stream_host_keyboard_enhancement_flags();
+            self.tick_spinner_if_due(now, needs_full_render);
 
             // 7. Render virtually and stream frames. Hidden-only PTY work keeps a
             // bounded classification cadence without delaying presentation work
@@ -1609,6 +1610,83 @@ impl HeadlessServer {
         let patch_allowed = self.app.spinner_patch_allowed();
         self.app
             .sync_spinner_timer(now, has_spinner_cells, patch_allowed);
+    }
+
+    /// Animated working indicator: advance the phase and stream the changed
+    /// glyph cells to every eligible client as a sparse patch. This never
+    /// schedules a render; when a full render is already pending it carries
+    /// the new phase, and when an overlay blocks patches the timer disarms
+    /// until the next full render re-evaluates it.
+    fn tick_spinner_if_due(&mut self, now: Instant, full_render_pending: bool) {
+        if !self.app.spinner_tick_due(now) {
+            return;
+        }
+        crate::render_prof::event("spinner.tick");
+        self.app.advance_spinner_phase(now);
+        if full_render_pending {
+            crate::render_prof::event("spinner.skip.full_render_pending");
+        } else if !self.app.spinner_patch_allowed() {
+            crate::render_prof::event("spinner.skip.gate");
+        } else {
+            self.stream_spinner_patches();
+        }
+        self.sync_spinner_timer(now);
+    }
+
+    fn stream_spinner_patches(&mut self) {
+        let glyph = crate::ui::spinner_frame(self.app.state.spinner_phase);
+        let targets = render_targets(&self.clients, self.foreground_client_id);
+        let mut broken_clients: Vec<u64> = Vec::new();
+        for (client_id, (cols, rows), _cell_size, _is_foreground, mode) in targets {
+            if !matches!(mode, ClientConnectionMode::App) {
+                continue;
+            }
+            let Some(client) = self.clients.get_mut(&client_id) else {
+                continue;
+            };
+            if client.deferred_render() != DeferredRender::None
+                || client.graphics_surface_reset_pending
+            {
+                crate::render_prof::event("spinner.skip.client_state");
+                continue;
+            }
+            let Some(patch) = client.render_state.spinner_patch(cols, rows, glyph) else {
+                crate::render_prof::event("spinner.skip.no_baseline");
+                continue;
+            };
+            let Some(writer) = client.writer.as_ref().cloned() else {
+                continue;
+            };
+            let Some(prepared) = client.render_state.prepare_patch(patch) else {
+                crate::render_prof::event("spinner.skip.repaint_pending");
+                continue;
+            };
+            let serialized = match Self::frame_server_message(prepared.message()) {
+                Ok(framed) => framed,
+                Err(err) => {
+                    warn!(client_id, err = %err, "failed to serialize spinner patch");
+                    continue;
+                }
+            };
+            crate::render_prof::counter("spinner.bytes", serialized.len() as u64);
+            match writer.render.try_send(serialized) {
+                Ok(()) => {
+                    client.render_state.commit_patch(prepared);
+                    crate::render_prof::event("spinner.patch_sent");
+                }
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    // Drop the tick. Deferring would turn a cosmetic update into
+                    // a full render when the writer drains.
+                    crate::render_prof::event("spinner.skip.queue_full");
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    broken_clients.push(client_id);
+                }
+            }
+        }
+        for client_id in broken_clients {
+            self.remove_client_and_resize_if_needed(client_id);
+        }
     }
 
     fn remove_client(&mut self, client_id: u64) -> bool {
@@ -11835,5 +11913,402 @@ next_tab = ""
              handle_internal_event_with_forwarding (bypass risk):\n  {}",
             bypass_lines.join("\n  ")
         );
+    }
+
+    fn animated_test_server() -> (
+        HeadlessServer,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        FrameData,
+        Instant,
+    ) {
+        let (mut server, client_rx, _) = retained_test_server(b"hello");
+        set_first_test_pane_working(&mut server);
+        server.app.state.status_indicators = crate::config::StatusIndicatorStyle::Animated;
+        server.render_and_stream();
+        let frame = read_server_frame(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial frame"),
+        );
+        let now = server.app.next_spinner_tick.expect("timer armed");
+        (server, client_rx, frame, now)
+    }
+
+    #[tokio::test]
+    async fn spinner_tick_streams_a_frame_patch_to_semantic_clients() {
+        let (mut server, client_rx, initial, now) = animated_test_server();
+        let cells = server.clients[&1].render_state.spinner_cells().to_vec();
+
+        server.tick_spinner_if_due(now, false);
+
+        let message = read_server_message(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("spinner patch"),
+        );
+        let ServerMessage::FramePatch(patch) = message else {
+            panic!("expected FramePatch, got {message:?}");
+        };
+        assert_eq!((patch.width, patch.height), (80, 24));
+        assert_eq!(patch.cells.len(), cells.len());
+        for cell_patch in &patch.cells {
+            assert!(cells.contains(&cell_patch.index));
+            let before = &initial.cells[cell_patch.index as usize];
+            assert_eq!(cell_patch.cell.symbol, crate::ui::spinner_frame(1));
+            assert_eq!(cell_patch.cell.fg, before.fg);
+            assert_eq!(cell_patch.cell.bg, before.bg);
+            assert_eq!(cell_patch.cell.modifier, before.modifier);
+            assert_eq!(cell_patch.cell.hyperlink, None);
+        }
+        assert_eq!(server.app.state.spinner_phase, 1);
+        assert_eq!(
+            server.app.next_spinner_tick,
+            Some(now + crate::app::SPINNER_INTERVAL)
+        );
+
+        let retained = server.clients[&1]
+            .render_state
+            .last_frame()
+            .expect("baseline")
+            .clone();
+        for index in &cells {
+            assert_eq!(
+                retained.cells[*index as usize].symbol,
+                crate::ui::spinner_frame(1),
+                "server baseline follows the patch"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spinner_tick_is_a_no_op_before_its_deadline() {
+        let (mut server, client_rx, _, now) = animated_test_server();
+        server.tick_spinner_if_due(now - Duration::from_millis(1), false);
+        assert!(client_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert_eq!(server.app.state.spinner_phase, 0);
+    }
+
+    #[tokio::test]
+    async fn spinner_tick_skips_the_patch_when_a_full_render_is_pending() {
+        let (mut server, client_rx, _, now) = animated_test_server();
+        server.tick_spinner_if_due(now, true);
+        assert!(
+            client_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "the pending full render carries the new phase"
+        );
+        assert_eq!(server.app.state.spinner_phase, 1, "phase still advances");
+        assert_eq!(
+            server.app.next_spinner_tick,
+            Some(now + crate::app::SPINNER_INTERVAL)
+        );
+
+        server.render_and_stream();
+        let frame = read_server_frame(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("full frame"),
+        );
+        for index in server.clients[&1].render_state.spinner_cells() {
+            assert_eq!(
+                frame.cells[*index as usize].symbol,
+                crate::ui::spinner_frame(1),
+                "the full render shows the advanced phase"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spinner_tick_skips_clients_whose_size_changed_since_the_baseline() {
+        let (mut server, client_rx, _, now) = animated_test_server();
+        server.clients.get_mut(&1).expect("client").terminal_size = (100, 30);
+        server.tick_spinner_if_due(now, false);
+        assert!(client_rx.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    #[tokio::test]
+    async fn spinner_tick_disarms_while_the_config_diagnostic_is_visible() {
+        let (mut server, client_rx, _, now) = animated_test_server();
+        server.app.state.config_diagnostic = Some("bad key".into());
+        server.tick_spinner_if_due(now, false);
+        assert!(client_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert_eq!(server.app.next_spinner_tick, None);
+    }
+
+    #[tokio::test]
+    async fn spinner_patch_survives_a_retained_pty_update_and_the_next_full_render() {
+        let (mut server, client_rx, pane_id) = retained_test_server(b"aaaa");
+        set_first_test_pane_working(&mut server);
+        server.app.state.status_indicators = crate::config::StatusIndicatorStyle::Animated;
+        server.render_and_stream();
+        read_server_frame(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial frame"),
+        );
+        let cells = server.clients[&1].render_state.spinner_cells().to_vec();
+
+        let now = server.app.next_spinner_tick.expect("timer armed");
+        server.tick_spinner_if_due(now, false);
+        let ServerMessage::FramePatch(_) = read_server_message(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("patch"),
+        ) else {
+            panic!("expected FramePatch");
+        };
+
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        runtime.test_process_pty_bytes(b"\rZ");
+        assert!(server.render_retained_pty_update_and_stream());
+        let retained = read_server_frame(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("retained frame"),
+        );
+        assert!(retained.cells.iter().any(|cell| cell.symbol == "Z"));
+        for index in &cells {
+            assert_eq!(
+                retained.cells[*index as usize].symbol,
+                crate::ui::spinner_frame(1),
+                "the retained PTY frame keeps the patched glyph"
+            );
+        }
+
+        server.render_and_stream();
+        assert!(
+            client_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "no double send after a patch plus a retained update"
+        );
+    }
+
+    #[tokio::test]
+    async fn spinner_tick_skips_semantic_clients_without_a_baseline() {
+        let (mut server, client_rx, _, now) = animated_test_server();
+        server
+            .clients
+            .get_mut(&1)
+            .expect("client")
+            .request_semantic_redraw_after_input();
+        server.tick_spinner_if_due(now, false);
+        assert!(client_rx.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    #[tokio::test]
+    async fn spinner_tick_drops_the_patch_when_the_render_queue_is_full() {
+        let (mut server, client_rx, _, now) = animated_test_server();
+        let writer = server.clients[&1].writer.clone().expect("writer");
+        writer.test_fill_render(vec![0xAA]);
+
+        server.tick_spinner_if_due(now, false);
+
+        assert_eq!(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("filler"),
+            vec![0xAA]
+        );
+        assert!(client_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert_eq!(
+            server.clients[&1].deferred_render(),
+            DeferredRender::None,
+            "a dropped tick never schedules a full render"
+        );
+        assert!(
+            !server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 1 }),
+            "a drained writer does not request a full render either"
+        );
+        assert!(client_rx.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    #[tokio::test]
+    async fn spinner_tick_disarms_while_an_overlay_blocks_patches() {
+        let (mut server, client_rx, _, now) = animated_test_server();
+        server.app.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::NeedsAttention,
+            title: "pi needs attention".to_owned(),
+            context: String::new(),
+            position: None,
+            target: None,
+        });
+
+        server.tick_spinner_if_due(now, false);
+
+        assert!(client_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        assert_eq!(server.app.next_spinner_tick, None);
+    }
+
+    #[tokio::test]
+    async fn spinner_tick_disarms_when_no_client_holds_spinner_cells() {
+        let (mut server, _client_rx, _, now) = animated_test_server();
+        server.clients.clear();
+        server.tick_spinner_if_due(now, false);
+        assert_eq!(server.app.next_spinner_tick, None);
+    }
+
+    #[tokio::test]
+    async fn spinner_patch_matches_a_full_render_at_the_next_phase() {
+        fn two_client_server() -> (
+            HeadlessServer,
+            std::sync::mpsc::Receiver<Vec<u8>>,
+            std::sync::mpsc::Receiver<Vec<u8>>,
+        ) {
+            let (mut server, desktop_rx, _) = retained_test_server(b"hello");
+            set_first_test_pane_working(&mut server);
+            server.app.state.status_indicators = crate::config::StatusIndicatorStyle::Animated;
+            let (mobile_tx, _mobile_control_rx, mobile_rx) = test_client_writer();
+            server.clients.insert(
+                2,
+                ClientConnection::new(
+                    (44, 20),
+                    crate::kitty_graphics::HostCellSize::default(),
+                    crate::terminal_theme::TerminalTheme::default(),
+                    None,
+                    2,
+                    RenderEncoding::SemanticFrame,
+                    Some(mobile_tx),
+                ),
+            );
+            (server, desktop_rx, mobile_rx)
+        }
+
+        let (mut patched, patched_desktop_rx, patched_mobile_rx) = two_client_server();
+        let (mut full, full_desktop_rx, full_mobile_rx) = two_client_server();
+
+        patched.render_and_stream();
+        let mut desktop = read_server_frame(
+            patched_desktop_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("desktop baseline"),
+        );
+        let mut mobile = read_server_frame(
+            patched_mobile_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("mobile baseline"),
+        );
+        full.render_and_stream();
+        let _ = full_desktop_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("full desktop baseline");
+        let _ = full_mobile_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("full mobile baseline");
+
+        let now = patched.app.next_spinner_tick.expect("timer armed");
+        patched.tick_spinner_if_due(now, false);
+        for (rx, frame) in [
+            (&patched_desktop_rx, &mut desktop),
+            (&patched_mobile_rx, &mut mobile),
+        ] {
+            let ServerMessage::FramePatch(patch) =
+                read_server_message(rx.recv_timeout(Duration::from_millis(100)).expect("patch"))
+            else {
+                panic!("expected FramePatch");
+            };
+            assert!(!patch.cells.is_empty());
+            assert!(patch.apply_to(frame));
+        }
+
+        full.app.state.spinner_phase = 1;
+        full.render_and_stream();
+        let full_desktop = read_server_frame(
+            full_desktop_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("full desktop"),
+        );
+        let full_mobile = read_server_frame(
+            full_mobile_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("full mobile"),
+        );
+
+        assert_frame_data_eq(&desktop, &full_desktop);
+        assert_frame_data_eq(&mobile, &full_mobile);
+    }
+
+    #[tokio::test]
+    async fn spinner_tick_streams_a_sparse_ansi_frame_to_terminal_ansi_clients() {
+        let (mut server, _semantic_rx, _) = retained_test_server(b"hello");
+        set_first_test_pane_working(&mut server);
+        server.app.state.status_indicators = crate::config::StatusIndicatorStyle::Animated;
+        let (ansi_tx, _ansi_control_rx, ansi_rx) = test_client_writer();
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::TerminalAnsi,
+                Some(ansi_tx),
+            ),
+        );
+
+        server.render_and_stream();
+        let ServerMessage::Terminal(first) = read_server_message(
+            ansi_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial ansi frame"),
+        ) else {
+            panic!("expected Terminal");
+        };
+        assert!(first.full);
+        assert_eq!(first.seq, 1);
+
+        let now = server.app.next_spinner_tick.expect("timer armed");
+        server.tick_spinner_if_due(now, false);
+
+        let ServerMessage::Terminal(patch) = read_server_message(
+            ansi_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("ansi patch"),
+        ) else {
+            panic!("expected Terminal");
+        };
+        assert!(!patch.full);
+        assert_eq!(patch.seq, 2);
+        let bytes = String::from_utf8(patch.bytes).unwrap();
+        assert!(bytes.starts_with("\x1b[?2026h\x1b[?25l"));
+        assert!(bytes.contains(crate::ui::spinner_frame(1)));
+        assert!(!bytes.contains("hello"), "pane content is not rewritten");
+        assert_eq!(server.clients[&2].render_state.terminal_seq(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn spinner_tick_skips_terminal_ansi_clients_with_repaint_pending() {
+        let (mut server, _semantic_rx, _) = retained_test_server(b"hello");
+        set_first_test_pane_working(&mut server);
+        server.app.state.status_indicators = crate::config::StatusIndicatorStyle::Animated;
+        let (ansi_tx, _ansi_control_rx, ansi_rx) = test_client_writer();
+        server.clients.insert(
+            2,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::TerminalAnsi,
+                Some(ansi_tx),
+            ),
+        );
+        server.render_and_stream();
+        ansi_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("initial ansi frame");
+
+        server
+            .clients
+            .get_mut(&2)
+            .expect("client")
+            .request_repaint();
+        let now = server.app.next_spinner_tick.expect("timer armed");
+        server.tick_spinner_if_due(now, false);
+
+        assert!(ansi_rx.recv_timeout(Duration::from_millis(50)).is_err());
     }
 }

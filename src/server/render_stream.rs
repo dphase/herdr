@@ -87,16 +87,32 @@ impl ClientRenderState {
 
     pub(crate) fn request_repaint(&mut self) {
         match self {
-            Self::Semantic { last_frame, .. } => *last_frame = None,
+            Self::Semantic {
+                last_frame,
+                spinner_cells,
+            } => {
+                *last_frame = None;
+                spinner_cells.clear();
+            }
             Self::TerminalAnsi {
-                repaint_pending, ..
-            } => *repaint_pending = true,
+                repaint_pending,
+                spinner_cells,
+                ..
+            } => {
+                *repaint_pending = true;
+                spinner_cells.clear();
+            }
         }
     }
 
     pub(crate) fn reset_semantic_input_baseline(&mut self) {
-        if let Self::Semantic { last_frame, .. } = self {
+        if let Self::Semantic {
+            last_frame,
+            spinner_cells,
+        } = self
+        {
             *last_frame = None;
+            spinner_cells.clear();
         }
     }
 
@@ -193,6 +209,116 @@ impl ClientRenderState {
             Self::TerminalAnsi { seq, .. } => Some(*seq),
         }
     }
+
+    /// Builds the sparse patch that swaps every recorded spinner cell to
+    /// `glyph`. `None` when there is no retained frame of the client's current
+    /// size, no recorded cells, or nothing would change. The visible cursor
+    /// cell is never patched (chrome cells never hold it, but drawn-cursor
+    /// clients keep that cell reversed in their baseline).
+    pub(crate) fn spinner_patch(
+        &self,
+        cols: u16,
+        rows: u16,
+        glyph: &str,
+    ) -> Option<crate::protocol::FramePatch> {
+        let frame = self.last_frame()?;
+        if frame.width != cols || frame.height != rows {
+            return None;
+        }
+        let cursor_index = frame
+            .cursor
+            .as_ref()
+            .filter(|cursor| cursor.visible)
+            .map(|cursor| usize::from(cursor.y) * usize::from(frame.width) + usize::from(cursor.x));
+        let cells: Vec<crate::protocol::CellPatch> = self
+            .spinner_cells()
+            .iter()
+            .filter_map(|&index| {
+                let idx = index as usize;
+                if Some(idx) == cursor_index {
+                    return None;
+                }
+                let cell = frame.cells.get(idx)?;
+                if cell.symbol == glyph {
+                    return None;
+                }
+                Some(crate::protocol::CellPatch {
+                    index,
+                    cell: crate::protocol::CellData {
+                        symbol: glyph.to_owned(),
+                        ..cell.clone()
+                    },
+                })
+            })
+            .collect();
+        (!cells.is_empty()).then_some(crate::protocol::FramePatch {
+            width: frame.width,
+            height: frame.height,
+            cells,
+        })
+    }
+
+    /// Prepares a patch for the wire. Semantic clients receive the patch
+    /// itself; terminal-ANSI clients receive the encoded cells as a partial
+    /// terminal frame. `None` while an ANSI repaint is pending, because the
+    /// next frame will be a full redraw anyway.
+    pub(crate) fn prepare_patch(
+        &mut self,
+        patch: crate::protocol::FramePatch,
+    ) -> Option<PreparedPatch> {
+        match self {
+            Self::Semantic { .. } => Some(PreparedPatch {
+                message: ServerMessage::FramePatch(patch.clone()),
+                patch,
+                encoded: None,
+            }),
+            Self::TerminalAnsi {
+                blit_encoder,
+                seq,
+                repaint_pending,
+                ..
+            } => {
+                if *repaint_pending {
+                    return None;
+                }
+                let encoded = blit_encoder.encode_patch(&patch, false)?;
+                let message = ServerMessage::Terminal(TerminalFrame {
+                    seq: *seq + 1,
+                    width: patch.width,
+                    height: patch.height,
+                    full: false,
+                    bytes: encoded.bytes.clone(),
+                });
+                Some(PreparedPatch {
+                    message,
+                    patch,
+                    encoded: Some(encoded),
+                })
+            }
+        }
+    }
+
+    /// Commits a sent patch into the retained baseline.
+    pub(crate) fn commit_patch(&mut self, prepared: PreparedPatch) {
+        let PreparedPatch { patch, encoded, .. } = prepared;
+        match (self, encoded) {
+            (Self::Semantic { last_frame, .. }, _) => {
+                if let Some(frame) = last_frame.as_mut() {
+                    patch.apply_to(frame);
+                }
+            }
+            (
+                Self::TerminalAnsi {
+                    blit_encoder, seq, ..
+                },
+                Some(encoded),
+            ) => {
+                blit_encoder.commit_patch(&patch, encoded);
+                *seq += 1;
+            }
+            (Self::TerminalAnsi { .. }, None) => {}
+        }
+    }
 }
 
 fn insert_graphics_before_sync_end(encoded: &mut Vec<u8>, graphics: &[u8]) {
@@ -234,6 +360,19 @@ impl PreparedRender {
             Self::TerminalAnsi { frame, .. } => Some(frame),
             _ => None,
         }
+    }
+}
+
+/// A prepared sparse patch plus the baseline update to apply after it is sent.
+pub(crate) struct PreparedPatch {
+    message: ServerMessage,
+    patch: crate::protocol::FramePatch,
+    encoded: Option<EncodedBlit>,
+}
+
+impl PreparedPatch {
+    pub(crate) fn message(&self) -> &ServerMessage {
+        &self.message
     }
 }
 
@@ -767,6 +906,71 @@ mod tests {
         // Collapsed rows: one icon on the workspace row and one on the agent
         // detail row.
         assert_eq!(collect_spinner_cells(&buffer).len(), 2);
+    }
+
+    #[test]
+    fn spinner_patch_skips_the_visible_cursor_cell() {
+        use crate::protocol::{CellData, CursorState, FrameData};
+        let cell = |s: &str| CellData {
+            symbol: s.to_owned(),
+            fg: 0,
+            bg: 0,
+            modifier: 0,
+            skip: false,
+            hyperlink: None,
+        };
+        let frame = FrameData {
+            cells: vec![cell("◐"), cell("◐"), cell("x"), cell("x")],
+            width: 2,
+            height: 2,
+            cursor: Some(CursorState {
+                x: 1,
+                y: 0,
+                visible: true,
+                shape: 0,
+            }), // row-major index 1
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        let state = ClientRenderState::Semantic {
+            last_frame: Some(frame),
+            spinner_cells: vec![0, 1],
+        };
+        let patch = state.spinner_patch(2, 2, "⠙").expect("patch");
+        // Index 1 is the visible cursor cell -> excluded; only index 0 is patched.
+        assert_eq!(patch.cells.len(), 1);
+        assert_eq!(patch.cells[0].index, 0);
+        assert_eq!(patch.cells[0].cell.symbol, "⠙");
+    }
+
+    #[test]
+    fn spinner_patch_skips_cells_already_showing_the_glyph() {
+        use crate::protocol::{CellData, FrameData};
+        let cell = |s: &str| CellData {
+            symbol: s.to_owned(),
+            fg: 0,
+            bg: 0,
+            modifier: 0,
+            skip: false,
+            hyperlink: None,
+        };
+        let frame = FrameData {
+            cells: vec![cell("⠙"), cell("◐")],
+            width: 2,
+            height: 1,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        let state = ClientRenderState::Semantic {
+            last_frame: Some(frame),
+            spinner_cells: vec![0, 1],
+        };
+        let patch = state.spinner_patch(2, 1, "⠙").expect("patch");
+        // Index 0 already shows ⠙ (a no-op) -> skipped; only index 1 is patched.
+        assert_eq!(patch.cells.len(), 1);
+        assert_eq!(patch.cells[0].index, 1);
+        assert_eq!(patch.cells[0].cell.symbol, "⠙");
     }
 
     #[test]

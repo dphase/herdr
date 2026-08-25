@@ -588,17 +588,12 @@ impl App {
         }
     }
 
-    // The production consumer is the headless server's spinner tick that reads
-    // these to fire and reschedule a patch; it lands in a follow-up task, so for
-    // now they are exercised only by the App timer tests.
-    #[allow(dead_code)]
     pub(crate) fn spinner_tick_due(&self, now: Instant) -> bool {
         self.next_spinner_tick
             .is_some_and(|deadline| now >= deadline)
     }
 
     /// Advances to the next spinner frame and schedules the following tick.
-    #[allow(dead_code)]
     pub(crate) fn advance_spinner_phase(&mut self, now: Instant) {
         let frames = crate::ui::SPINNER_FRAMES.len() as u8;
         self.state.spinner_phase = (self.state.spinner_phase + 1) % frames;
