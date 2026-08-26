@@ -342,7 +342,14 @@ Agent status uses compact colored dots by default. To distinguish blocked, worki
 status_indicators = "symbols"
 ```
 
-The symbols are static, so this option does not enable spinner animation.
+The symbols are static. To spin the working indicator through braille frames instead, choose **animated symbols** in Settings or configure:
+
+```toml
+[ui]
+status_indicators = "animated"
+```
+
+Animation repaints only the indicator cells, about eight times a second, while at least one agent is working. Terminals that pause cursor blinking during output show a steady cursor while agents work. In `herdr --no-session` the working indicator shows the first frame and does not animate; animation is driven by the Herdr server.
 
 ### Sidebar row layouts
 

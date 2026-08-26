@@ -338,7 +338,14 @@ window_title = "{hostname}: {workspace}"
 status_indicators = "symbols"
 ```
 
-这些符号是静态的，因此该选项不会启用旋转动画。
+这些符号是静态的。若要让 working 指示符以盲文帧旋转，请在设置中选择 **animated symbols**，或配置：
+
+```toml
+[ui]
+status_indicators = "animated"
+```
+
+只要有智能体处于 working 状态，动画就会以每秒约 8 次的频率仅重绘指示符所在的单元格。在输出期间会暂停光标闪烁的终端上，智能体工作时光标将保持常亮。在 `herdr --no-session` 模式下，working 指示符只显示第一帧且不会动画；动画由 Herdr 服务器驱动。
 
 ### 侧边栏行布局
 
