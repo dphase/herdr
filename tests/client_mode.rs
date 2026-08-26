@@ -329,6 +329,45 @@ fn read_next_frame_payload(stream: &mut UnixStream, timeout: Duration) -> Result
     Err("timed out waiting for Frame message".into())
 }
 
+#[derive(Debug, Deserialize)]
+struct CellPatchWire {
+    index: u32,
+    cell: CellWire,
+}
+
+#[derive(Debug, Deserialize)]
+struct FramePatchWire {
+    width: u16,
+    height: u16,
+    cells: Vec<CellPatchWire>,
+}
+
+/// Waits for the next FramePatch (tag 15), returning it with the most recent
+/// full Frame (tag 1) seen on the way.
+fn read_next_frame_patch(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> Result<(Option<FrameWire>, FramePatchWire), String> {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + timeout;
+    let mut last_frame = None;
+    while Instant::now() < deadline {
+        match read_server_message(stream) {
+            Ok((1, payload)) => last_frame = decode_frame_payload(&payload).ok(),
+            Ok((15, payload)) => {
+                let (patch, _): (FramePatchWire, usize) =
+                    bincode::serde::decode_from_slice(&payload, bincode::config::standard())
+                        .map_err(|e| e.to_string())?;
+                return Ok((last_frame, patch));
+            }
+            _ => continue,
+        }
+    }
+    Err("timed out waiting for FramePatch".into())
+}
+
 fn frame_text(frame: &FrameWire) -> String {
     if frame.cells.is_empty() {
         return String::new();
@@ -387,6 +426,86 @@ fn client_connects_and_receives_frame() {
 
     read_next_frame_payload(&mut stream, Duration::from_secs(10))
         .expect("should receive a frame from server");
+
+    cleanup_spawned_herdr(spawned, base);
+}
+
+#[test]
+fn animated_indicator_streams_frame_patches_to_attached_clients() {
+    // An attached semantic client receives ServerMessage::FramePatch (tag 15)
+    // ticks while an agent is working under the animated indicator style.
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let spawned = spawn_server_with_config(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &client_socket,
+        "onboarding = false\n\n[ui]\nstatus_indicators = \"animated\"\n",
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+
+    let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
+    client_handshake(&mut stream, CURRENT_PROTOCOL, 80, 24).expect("handshake should succeed");
+    read_next_frame_payload(&mut stream, Duration::from_secs(10)).expect("initial frame");
+
+    let created = send_json_request(
+        &api_socket,
+        &serde_json::json!({
+            "id": "ws",
+            "method": "workspace.create",
+            "params": { "label": "spin" }
+        })
+        .to_string(),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .expect("root pane id")
+        .to_string();
+    let reported = send_json_request(
+        &api_socket,
+        &serde_json::json!({
+            "id": "report",
+            "method": "pane.report_agent",
+            "params": {
+                "pane_id": pane_id,
+                "agent": "pi",
+                "state": "working",
+                "source": "client-mode-test"
+            }
+        })
+        .to_string(),
+    );
+    assert!(
+        reported.get("error").is_none(),
+        "pane.report_agent failed: {reported}"
+    );
+
+    let (frame, patch) =
+        read_next_frame_patch(&mut stream, Duration::from_secs(5)).expect("frame patch");
+    let frame = frame.expect("a full frame precedes the first patch");
+    assert_eq!((patch.width, patch.height), (80, 24));
+    assert!(!patch.cells.is_empty());
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    for cell in &patch.cells {
+        assert!(
+            FRAMES.contains(&cell.cell.symbol.as_str()),
+            "patched glyph is a spinner frame: {:?}",
+            cell.cell.symbol
+        );
+        let before = &frame.cells[cell.index as usize];
+        assert!(
+            FRAMES.contains(&before.symbol.as_str()),
+            "the patched index held a spinner cell in the preceding full frame"
+        );
+        assert_eq!(cell.cell.fg, before.fg, "working color is preserved");
+    }
 
     cleanup_spawned_herdr(spawned, base);
 }
