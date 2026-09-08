@@ -14,7 +14,11 @@ fn theme_index(name: &str) -> usize {
 }
 
 fn indicator_index(style: crate::config::StatusIndicatorStyle) -> usize {
-    usize::from(style == crate::config::StatusIndicatorStyle::Symbols)
+    match style {
+        crate::config::StatusIndicatorStyle::Dots => 0,
+        crate::config::StatusIndicatorStyle::Symbols => 1,
+        crate::config::StatusIndicatorStyle::Animated => 2,
+    }
 }
 
 fn toast_index(delivery: crate::config::ToastDelivery) -> usize {
@@ -48,7 +52,9 @@ impl ClientShellState {
     fn selected_index_for_settings_section(&self, section: ClientSettingsSection) -> usize {
         match section {
             ClientSettingsSection::Theme => theme_index(&self.config.theme_name),
-            ClientSettingsSection::Indicators => indicator_index(self.config.status_indicators),
+            ClientSettingsSection::Indicators => {
+                indicator_index(self.config.status_indicators.style)
+            }
             ClientSettingsSection::Sound => usize::from(!self.config.sound_enabled),
             ClientSettingsSection::Toast => toast_index(self.config.toast_delivery),
             ClientSettingsSection::Integrations => 0,
@@ -97,7 +103,8 @@ impl ClientShellState {
         match self.overlay.as_ref() {
             Some(ClientShellOverlay::Settings(settings)) => match settings.section {
                 ClientSettingsSection::Theme => crate::config::THEME_NAMES.len(),
-                ClientSettingsSection::Indicators | ClientSettingsSection::Sound => 2,
+                ClientSettingsSection::Indicators => 3,
+                ClientSettingsSection::Sound => 2,
                 ClientSettingsSection::Toast => 4,
                 ClientSettingsSection::Integrations => settings.integrations.len(),
             },
@@ -197,10 +204,10 @@ impl ClientShellState {
                 }
             }
             ClientSettingsSection::Indicators => {
-                let style = if selected == 0 {
-                    crate::config::StatusIndicatorStyle::Dots
-                } else {
-                    crate::config::StatusIndicatorStyle::Symbols
+                let style = match selected {
+                    0 => crate::config::StatusIndicatorStyle::Dots,
+                    1 => crate::config::StatusIndicatorStyle::Symbols,
+                    _ => crate::config::StatusIndicatorStyle::Animated,
                 };
                 self.save_settings_edit(
                     crate::config::ConfigEdit::StatusIndicators(style),

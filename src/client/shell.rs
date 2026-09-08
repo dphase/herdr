@@ -175,29 +175,63 @@ fn pane_surface_topology_signature(surface: &PaneSurfaceFrame) -> u64 {
     hash
 }
 
+/// Braille frames for the animated working indicator, in display order.
+pub(crate) const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Interval between spinner frames while at least one agent is working.
+pub(crate) const SPINNER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(128);
+
+/// Resolved status indicator presentation: the configured style plus the
+/// client-local spinner phase that the animated style reads on every repaint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StatusIndicators {
+    pub(super) style: crate::config::StatusIndicatorStyle,
+    /// Current frame of the animated working indicator (`0..SPINNER_FRAMES.len()`).
+    pub(super) spinner_phase: u8,
+}
+
+impl StatusIndicators {
+    pub(crate) const fn new(style: crate::config::StatusIndicatorStyle) -> Self {
+        Self {
+            style,
+            spinner_phase: 0,
+        }
+    }
+}
+
 fn status_icon(
     status: crate::api::schema::AgentStatus,
-    style: crate::config::StatusIndicatorStyle,
+    indicators: StatusIndicators,
 ) -> &'static str {
     use crate::api::schema::AgentStatus;
     use crate::config::StatusIndicatorStyle;
-    match (style, status) {
+    match (indicators.style, status) {
         (
             StatusIndicatorStyle::Dots,
             AgentStatus::Working | AgentStatus::Blocked | AgentStatus::Done,
         ) => "●",
         (StatusIndicatorStyle::Dots, AgentStatus::Idle) => "○",
         (StatusIndicatorStyle::Dots, AgentStatus::Unknown) => "·",
-        (StatusIndicatorStyle::Symbols, AgentStatus::Blocked) => "×",
+        (StatusIndicatorStyle::Symbols | StatusIndicatorStyle::Animated, AgentStatus::Blocked) => {
+            "×"
+        }
         (StatusIndicatorStyle::Symbols, AgentStatus::Working) => "◐",
-        (StatusIndicatorStyle::Symbols, AgentStatus::Done) => "✓",
-        (StatusIndicatorStyle::Symbols, AgentStatus::Idle) => "○",
-        (StatusIndicatorStyle::Symbols, AgentStatus::Unknown) => "·",
+        (StatusIndicatorStyle::Animated, AgentStatus::Working) => {
+            SPINNER_FRAMES[usize::from(indicators.spinner_phase) % SPINNER_FRAMES.len()]
+        }
+        (StatusIndicatorStyle::Symbols | StatusIndicatorStyle::Animated, AgentStatus::Done) => "✓",
+        (StatusIndicatorStyle::Symbols | StatusIndicatorStyle::Animated, AgentStatus::Idle) => "○",
+        (StatusIndicatorStyle::Symbols | StatusIndicatorStyle::Animated, AgentStatus::Unknown) => {
+            "·"
+        }
     }
 }
 
 fn status_dot(status: crate::api::schema::AgentStatus) -> &'static str {
-    status_icon(status, crate::config::StatusIndicatorStyle::Dots)
+    status_icon(
+        status,
+        StatusIndicators::new(crate::config::StatusIndicatorStyle::Dots),
+    )
 }
 
 fn status_priority(status: crate::api::schema::AgentStatus) -> u8 {

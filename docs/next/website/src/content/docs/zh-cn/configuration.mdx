@@ -353,7 +353,14 @@ window_title = "{hostname}: {workspace}"
 status_indicators = "symbols"
 ```
 
-这些符号是静态的，因此该选项不会启用旋转动画。
+这些符号是静态的。若要让 working 指示符以盲文帧旋转，请在设置中选择 **animated symbols**，或配置：
+
+```toml
+[ui]
+status_indicators = "animated"
+```
+
+动画在客户端运行，仅当至少有一个可见智能体处于 working 状态时以每秒约 8 帧绘制。它不产生任何网络通信，也不影响连接到同一会话的其他客户端。
 
 ### 侧边栏行布局
 

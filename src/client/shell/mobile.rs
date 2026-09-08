@@ -293,7 +293,7 @@ fn render_agent_summary(
         if count == 0 {
             continue;
         }
-        let symbol = match (config.status_indicators, status) {
+        let symbol = match (config.status_indicators.style, status) {
             (crate::config::StatusIndicatorStyle::Dots, AgentStatus::Blocked) => Some("◉"),
             (crate::config::StatusIndicatorStyle::Dots, AgentStatus::Done) => Some("●"),
             (crate::config::StatusIndicatorStyle::Dots, _) => None,

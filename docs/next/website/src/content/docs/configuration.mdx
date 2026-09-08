@@ -357,7 +357,14 @@ Agent status uses compact colored dots by default. To distinguish blocked, worki
 status_indicators = "symbols"
 ```
 
-The symbols are static, so this option does not enable spinner animation.
+The symbols are static. To spin the working indicator through braille frames instead, choose **animated symbols** in Settings or configure:
+
+```toml
+[ui]
+status_indicators = "animated"
+```
+
+The animation runs in the client, about eight frames a second, only while at least one visible agent is working. Nothing crosses the wire for it and other clients attached to the same session are unaffected.
 
 ### Sidebar row layouts
 

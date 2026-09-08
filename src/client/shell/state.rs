@@ -24,7 +24,7 @@ pub(crate) struct ClientShellConfig {
     pub(super) spaces: SpacesSidebarConfig,
     pub(super) agents: crate::config::AgentsSidebarConfig,
     pub(super) agent_panel_sort: crate::config::AgentPanelSortConfig,
-    pub(super) status_indicators: crate::config::StatusIndicatorStyle,
+    pub(super) status_indicators: StatusIndicators,
     pub(super) sound_enabled: bool,
     pub(super) toast_delivery: crate::config::ToastDelivery,
     pub(super) toast_delay_seconds: u64,
@@ -918,6 +918,8 @@ pub(crate) struct ClientShellState {
     pub(super) input_leases: ClientInputLeases,
     pub(super) popup_pending: bool,
     pub(super) popup_pending_deadline: Option<std::time::Instant>,
+    /// Next animated indicator frame; `None` while nothing is spinning.
+    pub(super) spinner_deadline: Option<std::time::Instant>,
     pub(super) next_request_id: u64,
     pub(super) pending_requests: HashMap<String, PendingEndpointRequest>,
     pub(super) pending_integration_installs: usize,
@@ -1083,6 +1085,7 @@ impl ClientShellState {
             input_leases: ClientInputLeases::default(),
             popup_pending: false,
             popup_pending_deadline: None,
+            spinner_deadline: None,
             next_request_id: 1,
             pending_requests: HashMap::new(),
             pending_integration_installs: 0,
@@ -1853,14 +1856,65 @@ impl ClientShellState {
         false
     }
 
+    /// Whether any agent visible to this client is working, on any endpoint.
+    fn any_agent_working(&self) -> bool {
+        use crate::api::schema::AgentStatus;
+        let working = |snapshot: &ClientShellSnapshot| {
+            snapshot
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.agent_status == AgentStatus::Working)
+                || snapshot
+                    .agents
+                    .iter()
+                    .any(|agent| agent.agent_status == AgentStatus::Working)
+        };
+        self.snapshot.as_deref().is_some_and(working)
+            || self
+                .endpoints
+                .iter()
+                .filter_map(|endpoint| endpoint.snapshot.as_deref())
+                .any(working)
+    }
+
+    /// Arms the animated indicator while the style is animated and an agent is
+    /// working, advances the frame when due, and disarms otherwise. Returns
+    /// whether the frame changed and the shell needs a repaint.
+    pub(crate) fn tick_spinner(&mut self, now: std::time::Instant) -> bool {
+        let animate = self.config.status_indicators.style
+            == crate::config::StatusIndicatorStyle::Animated
+            && self.any_agent_working();
+        if !animate {
+            self.spinner_deadline = None;
+            return false;
+        }
+        match self.spinner_deadline {
+            Some(deadline) if now >= deadline => {
+                let frames = SPINNER_FRAMES.len() as u8;
+                let phase = &mut self.config.status_indicators.spinner_phase;
+                *phase = (*phase + 1) % frames;
+                self.spinner_deadline = Some(now + SPINNER_INTERVAL);
+                true
+            }
+            Some(_) => false,
+            None => {
+                self.spinner_deadline = Some(now + SPINNER_INTERVAL);
+                false
+            }
+        }
+    }
+
     pub(crate) fn timer_delay(&self, now: std::time::Instant) -> std::time::Duration {
         let default = std::time::Duration::from_millis(100);
-        self.selection_autoscroll_deadline
-            .into_iter()
-            .chain(self.selection_repaint_deadline)
-            .min()
-            .map(|deadline| deadline.saturating_duration_since(now).min(default))
-            .unwrap_or(default)
+        [
+            self.selection_autoscroll_deadline,
+            self.selection_repaint_deadline,
+            self.spinner_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|deadline| deadline.saturating_duration_since(now))
+        .fold(default, std::time::Duration::min)
     }
 
     pub(crate) fn invalidate_pane_surface(&mut self) {
